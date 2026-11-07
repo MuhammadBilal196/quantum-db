@@ -1,0 +1,96 @@
+# quantum-db / test harness — zero-dependency assertion recorder
+#
+#   Check.section("DbQuery")
+#   Check.eq("matches gt", DbQuery.matches({"age": 30}, {"age": {"$gt": 25}}), true)
+#   Check.report()
+#
+# Exposes the global: Check
+
+class __QDbCheck {
+    fn init() {
+        self.passed = 0
+        self.failed = 0
+        self.failures = []
+        self.group = ""
+    }
+
+    fn section(name) {
+        self.group = name
+        print("")
+        print(name)
+    }
+
+    fn pass(label) {
+        self.passed += 1
+        print("  ok   " + label)
+    }
+
+    fn failWith(label, detail) {
+        self.failed += 1
+        self.failures.push(self.group + " > " + label)
+        print("  FAIL " + label)
+        if detail != "" { print(detail) }
+    }
+
+    fn eq(label, actual, expected) {
+        if DbUtil.equals(actual, expected) {
+            self.pass(label)
+        } else {
+            self.failWith(label, "       expected: " + self.show(expected) + "\n       actual:   " + self.show(actual))
+        }
+    }
+
+    fn ok(label, condition) {
+        if condition {
+            self.pass(label)
+        } else {
+            self.failWith(label, "")
+        }
+    }
+
+    fn has(label, text, part) {
+        if type(text) == "string" and text.contains(part) {
+            self.pass(label)
+        } else {
+            self.failWith(label, "       expected to contain: " + self.show(part) + "\n       actual: " + self.show(text))
+        }
+    }
+
+    fn lacks(label, text, part) {
+        if type(text) == "string" and not text.contains(part) {
+            self.pass(label)
+        } else {
+            self.failWith(label, "       expected NOT to contain: " + self.show(part))
+        }
+    }
+
+    fn throws(label, action) {
+        let threw = false
+        try {
+            action()
+        } catch (e) {
+            threw = true
+        }
+        self.ok(label, threw)
+    }
+
+    fn show(v) {
+        if type(v) == "string" { return "\"" + v.replaceAll("\n", "\\n") + "\"" }
+        if v == null { return "null" }
+        return str(v)
+    }
+
+    fn report() {
+        print("")
+        let total = self.passed + self.failed
+        if self.failed == 0 {
+            print("PASS " + str(self.passed) + " passed, 0 failed, " + str(total) + " total")
+            return
+        }
+        print("FAIL " + str(self.passed) + " passed, " + str(self.failed) + " failed, " + str(total) + " total")
+        for f in self.failures { print("  - " + f) }
+        raise str(self.failed) + " test(s) failed"
+    }
+}
+
+Check = __QDbCheck()
