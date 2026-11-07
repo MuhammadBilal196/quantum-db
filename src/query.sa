@@ -1,0 +1,496 @@
+# quantum-db / query — filter evaluation, update operators, projection, joins and aggregations
+#
+#   DbQuery.matches(doc, {"age": {"$gte": 21}, "role": {"$in": ["admin", "lead"]}})
+#   DbQuery.applyChanges(doc, {"$inc": {"loginCount": 1}, "$set": {"active": true}})
+#   DbQuery.aggregate(rows, {"groupBy": "role", "metrics": {"total": {"$count": "*"}, "avgAge": {"$avg": "age"}}})
+#
+# Exposes the global: DbQuery
+
+class __QDbQuery {
+    fn init() {}
+
+    # ── SQL LIKE pattern matcher (% = any sequence, _ = single char) ─────
+
+    fn likeMatch(text, pattern, ignoreCase) {
+        let s = DbUtil.text(text)
+        let p = DbUtil.text(pattern)
+        if ignoreCase == true {
+            s = s.lower()
+            p = p.lower()
+        }
+        return self.matchLikeAt(s, 0, p, 0)
+    }
+
+    fn matchLikeAt(s, si, p, pi) {
+        let sLen = len(s)
+        let pLen = len(p)
+        while pi < pLen {
+            let pc = p[pi]
+            if pc == "%" {
+                while pi < pLen and p[pi] == "%" { pi += 1 }
+                if pi == pLen { return true }
+                let k = si
+                while k <= sLen {
+                    if self.matchLikeAt(s, k, p, pi) { return true }
+                    k += 1
+                }
+                return false
+            }
+            if si >= sLen { return false }
+            if pc != "_" and pc != s[si] { return false }
+            si += 1
+            pi += 1
+        }
+        return si == sLen
+    }
+
+    # ── Filter / WHERE evaluation ────────────────────────────────────────
+
+    fn matches(doc, whereSpec) {
+        if whereSpec == null { return true }
+        if type(whereSpec) != "dict" { return true }
+        if len(whereSpec.keys()) == 0 { return true }
+
+        for key in whereSpec.keys() {
+            let cond = whereSpec[key]
+            if key == "$and" {
+                if type(cond) != "array" { return false }
+                for sub in cond {
+                    if not self.matches(doc, sub) { return false }
+                }
+                continue
+            }
+            if key == "$or" {
+                if type(cond) != "array" or len(cond) == 0 { return false }
+                let anyHit = false
+                for sub in cond {
+                    if self.matches(doc, sub) {
+                        anyHit = true
+                        break
+                    }
+                }
+                if not anyHit { return false }
+                continue
+            }
+            if key == "$not" {
+                if self.matches(doc, cond) { return false }
+                continue
+            }
+
+            let exists = DbUtil.hasPath(doc, key)
+            let actual = DbUtil.getPath(doc, key)
+            if not self.matchesField(actual, exists, cond) {
+                return false
+            }
+        }
+        return true
+    }
+
+    fn isOperatorDict(d) {
+        if type(d) != "dict" { return false }
+        let keys = d.keys()
+        if len(keys) == 0 { return false }
+        for k in keys {
+            if k.startsWith("$") { return true }
+        }
+        return false
+    }
+
+    fn matchesField(actual, exists, cond) {
+        if not self.isOperatorDict(cond) {
+            return DbUtil.equals(actual, cond)
+        }
+
+        for op in cond.keys() {
+            let target = cond[op]
+            if op == "$eq" {
+                if not DbUtil.equals(actual, target) { return false }
+            } else if op == "$ne" {
+                if DbUtil.equals(actual, target) { return false }
+            } else if op == "$gt" {
+                if actual == null or DbUtil.compareValues(actual, target) <= 0 { return false }
+            } else if op == "$gte" {
+                if actual == null or DbUtil.compareValues(actual, target) < 0 { return false }
+            } else if op == "$lt" {
+                if actual == null or DbUtil.compareValues(actual, target) >= 0 { return false }
+            } else if op == "$lte" {
+                if actual == null or DbUtil.compareValues(actual, target) > 0 { return false }
+            } else if op == "$between" {
+                if type(target) != "array" or len(target) < 2 or actual == null { return false }
+                if DbUtil.compareValues(actual, target[0]) < 0 or DbUtil.compareValues(actual, target[1]) > 0 {
+                    return false
+                }
+            } else if op == "$in" {
+                if type(target) != "array" { return false }
+                let found = false
+                for item in target {
+                    if DbUtil.equals(actual, item) {
+                        found = true
+                        break
+                    }
+                }
+                if not found { return false }
+            } else if op == "$nin" {
+                if type(target) != "array" { return false }
+                for item in target {
+                    if DbUtil.equals(actual, item) { return false }
+                }
+            } else if op == "$contains" {
+                if type(actual) == "array" {
+                    let found = false
+                    for item in actual {
+                        if DbUtil.equals(item, target) {
+                            found = true
+                            break
+                        }
+                    }
+                    if not found { return false }
+                } else {
+                    if not DbUtil.text(actual).contains(DbUtil.text(target)) { return false }
+                }
+            } else if op == "$icontains" {
+                if not DbUtil.text(actual).lower().contains(DbUtil.text(target).lower()) { return false }
+            } else if op == "$startsWith" {
+                if not DbUtil.text(actual).startsWith(DbUtil.text(target)) { return false }
+            } else if op == "$endsWith" {
+                if not DbUtil.text(actual).endsWith(DbUtil.text(target)) { return false }
+            } else if op == "$like" {
+                if not self.likeMatch(actual, target, false) { return false }
+            } else if op == "$ilike" {
+                if not self.likeMatch(actual, target, true) { return false }
+            } else if op == "$all" {
+                if type(actual) != "array" or type(target) != "array" { return false }
+                for req in target {
+                    let hasItem = false
+                    for elem in actual {
+                        if DbUtil.equals(elem, req) {
+                            hasItem = true
+                            break
+                        }
+                    }
+                    if not hasItem { return false }
+                }
+            } else if op == "$size" {
+                if (type(actual) != "array" and type(actual) != "string") or len(actual) != target {
+                    return false
+                }
+            } else if op == "$exists" {
+                let want = target == true
+                let hasVal = exists and actual != null
+                if hasVal != want { return false }
+            } else if op == "$type" {
+                if not DbSchema.matchesType(actual, DbSchema.normalizeTypeName(target)) {
+                    return false
+                }
+            } else {
+                raise "unknown query operator: " + op
+            }
+        }
+        return true
+    }
+
+    # ── Update mutations ($set, $inc, $mul, $min, $max, $push, $pull, $unset) ──
+
+    fn applyChanges(doc, changes) {
+        let out = DbUtil.clone(doc)
+        if changes == null or type(changes) != "dict" { return out }
+
+        let hasOp = false
+        for k in changes.keys() {
+            if k.startsWith("$") {
+                hasOp = true
+                break
+            }
+        }
+
+        if not hasOp {
+            for k in changes.keys() {
+                DbUtil.setPath(out, k, DbUtil.clone(changes[k]))
+            }
+            return out
+        }
+
+        for op in changes.keys() {
+            let spec = changes[op]
+            if type(spec) != "dict" and op != "$unset" { continue }
+
+            if op == "$set" {
+                for f in spec.keys() { DbUtil.setPath(out, f, DbUtil.clone(spec[f])) }
+            } else if op == "$inc" {
+                for f in spec.keys() {
+                    let cur = DbUtil.getPath(out, f)
+                    let base = type(cur) == "number" ? cur : 0
+                    DbUtil.setPath(out, f, base + spec[f])
+                }
+            } else if op == "$mul" {
+                for f in spec.keys() {
+                    let cur = DbUtil.getPath(out, f)
+                    let base = type(cur) == "number" ? cur : 0
+                    DbUtil.setPath(out, f, base * spec[f])
+                }
+            } else if op == "$min" {
+                for f in spec.keys() {
+                    let cur = DbUtil.getPath(out, f)
+                    if cur == null or DbUtil.compareValues(spec[f], cur) < 0 {
+                        DbUtil.setPath(out, f, DbUtil.clone(spec[f]))
+                    }
+                }
+            } else if op == "$max" {
+                for f in spec.keys() {
+                    let cur = DbUtil.getPath(out, f)
+                    if cur == null or DbUtil.compareValues(spec[f], cur) > 0 {
+                        DbUtil.setPath(out, f, DbUtil.clone(spec[f]))
+                    }
+                }
+            } else if op == "$push" {
+                for f in spec.keys() {
+                    let cur = DbUtil.getPath(out, f)
+                    let arr = type(cur) == "array" ? DbUtil.clone(cur) : []
+                    arr.push(DbUtil.clone(spec[f]))
+                    DbUtil.setPath(out, f, arr)
+                }
+            } else if op == "$pull" {
+                for f in spec.keys() {
+                    let cur = DbUtil.getPath(out, f)
+                    if type(cur) == "array" {
+                        let kept = []
+                        for item in cur {
+                            if not DbUtil.equals(item, spec[f]) { kept.push(item) }
+                        }
+                        DbUtil.setPath(out, f, kept)
+                    }
+                }
+            } else if op == "$unset" {
+                let fieldsToDrop = type(spec) == "array" ? spec : spec.keys()
+                let trimmed = {}
+                for k in out.keys() {
+                    if not fieldsToDrop.contains(k) { trimmed[k] = out[k] }
+                }
+                out = trimmed
+            }
+        }
+        return out
+    }
+
+    # ── Projection (SELECT fields / aliases) ─────────────────────────────
+
+    fn projectRecord(doc, selectSpec) {
+        if selectSpec == null { return DbUtil.clone(doc) }
+        if type(selectSpec) == "array" {
+            if len(selectSpec) == 0 or (len(selectSpec) == 1 and selectSpec[0] == "*") {
+                return DbUtil.clone(doc)
+            }
+            let out = {}
+            for item in selectSpec {
+                if type(item) == "string" {
+                    if item == "*" {
+                        for k in doc.keys() { out[k] = DbUtil.clone(doc[k]) }
+                    } else {
+                        out[item] = DbUtil.clone(DbUtil.getPath(doc, item))
+                    }
+                } else if type(item) == "dict" {
+                    let f = item.get("field", "")
+                    let alias = item.get("as", f)
+                    out[alias] = DbUtil.clone(DbUtil.getPath(doc, f))
+                }
+            }
+            return out
+        }
+        return DbUtil.clone(doc)
+    }
+
+    fn project(records, selectSpec) {
+        if selectSpec == null { return DbUtil.clone(records) }
+        let out = []
+        for r in records { out.push(self.projectRecord(r, selectSpec)) }
+        return out
+    }
+
+    # ── Joins (inner, left, lookup) ──────────────────────────────────────
+
+    # joinSpec: {
+    #   "right": rightRecords, "localField": "id", "foreignField": "userId",
+    #   "type": "inner" | "left" | "lookup", "as": "orders", "prefix": "order_"
+    # }
+    fn executeJoin(leftRecords, rightRecords, joinSpec) {
+        let localField = joinSpec.get("localField", "id")
+        let foreignField = joinSpec.get("foreignField", "id")
+        let joinType = DbUtil.text(joinSpec.get("type", "inner")).lower()
+        let asField = DbUtil.text(joinSpec.get("as", ""))
+        let prefix = DbUtil.text(joinSpec.get("prefix", ""))
+
+        # Build hash bucket on rightRecords by foreignField
+        let buckets = {}
+        for r in rightRecords {
+            let fv = DbUtil.getPath(r, foreignField)
+            if fv == null { continue }
+            let key = DbUtil.safeKey(DbUtil.text(fv))
+            if not (key in buckets) { buckets[key] = [] }
+            buckets[key].push(r)
+        }
+
+        let out = []
+        for l in leftRecords {
+            let lv = DbUtil.getPath(l, localField)
+            let key = lv == null ? "" : DbUtil.safeKey(DbUtil.text(lv))
+            let matches = (key != "" and (key in buckets)) ? buckets[key] : []
+
+            if joinType == "lookup" {
+                let row = DbUtil.clone(l)
+                let targetName = asField != "" ? asField : "matches"
+                row[targetName] = DbUtil.clone(matches)
+                out.push(row)
+            } else if len(matches) > 0 {
+                for m in matches {
+                    let row = DbUtil.clone(l)
+                    if asField != "" {
+                        row[asField] = DbUtil.clone(m)
+                    } else {
+                        for mk in m.keys() {
+                            let colName = prefix != "" ? (prefix + mk) : ((mk in row) ? (foreignField + "_" + mk) : mk)
+                            row[colName] = DbUtil.clone(m[mk])
+                        }
+                    }
+                    out.push(row)
+                }
+            } else if joinType == "left" {
+                let row = DbUtil.clone(l)
+                if asField != "" { row[asField] = null }
+                out.push(row)
+            }
+        }
+        return out
+    }
+
+    # ── GroupBy & Aggregations (COUNT, SUM, AVG, MIN, MAX, DISTINCT) ─────
+
+    # aggSpec: {
+    #   "groupBy": "role" or ["department", "role"],
+    #   "metrics": {"count": {"$count": "*"}, "totalSalary": {"$sum": "salary"}, "avgAge": {"$avg": "age"}},
+    #   "having": {"count": {"$gte": 2}}
+    # }
+    fn aggregate(records, aggSpec) {
+        let groupBy = aggSpec.get("groupBy", [])
+        if type(groupBy) == "string" {
+            groupBy = groupBy == "" ? [] : [groupBy]
+        }
+        let metrics = aggSpec.get("metrics", {"count": {"$count": "*"}})
+        let having = aggSpec.get("having", null)
+
+        let groups = {}
+        let groupOrder = []
+        let sep = chr(1)
+
+        for r in records {
+            let keyParts = []
+            let groupValues = {}
+            for gf in groupBy {
+                let gv = DbUtil.getPath(r, gf)
+                keyParts.push(DbUtil.text(gv))
+                groupValues[gf] = gv
+            }
+            let rawKey = len(keyParts) == 0 ? "__all__" : keyParts.join(sep)
+            let sk = DbUtil.safeKey(rawKey)
+            if not (sk in groups) {
+                groups[sk] = {"keys": groupValues, "rows": []}
+                groupOrder.push(sk)
+            }
+            groups[sk]["rows"].push(r)
+        }
+
+        if len(groupOrder) == 0 and len(groupBy) == 0 {
+            let sk = "__all__"
+            groups[sk] = {"keys": {}, "rows": []}
+            groupOrder.push(sk)
+        }
+
+        let out = []
+        for sk in groupOrder {
+            let g = groups[sk]
+            let rows = g["rows"]
+            let resultRow = DbUtil.clone(g["keys"])
+
+            for alias in metrics.keys() {
+                let mSpec = metrics[alias]
+                resultRow[alias] = self.computeMetric(rows, mSpec)
+            }
+
+            if having == null or self.matches(resultRow, having) {
+                out.push(resultRow)
+            }
+        }
+        return out
+    }
+
+    fn computeMetric(rows, mSpec) {
+        if type(mSpec) != "dict" { return null }
+        let ops = mSpec.keys()
+        if len(ops) == 0 { return null }
+        let op = ops[0].lower()
+        let field = DbUtil.text(mSpec[ops[0]])
+
+        if op == "$count" or op == "count" {
+            if field == "*" or field == "" { return len(rows) }
+            let n = 0
+            for r in rows {
+                if DbUtil.getPath(r, field) != null { n += 1 }
+            }
+            return n
+        }
+
+        let nums = []
+        let vals = []
+        for r in rows {
+            let v = DbUtil.getPath(r, field)
+            if v != null {
+                vals.push(v)
+                if type(v) == "number" { nums.push(v) }
+            }
+        }
+
+        if op == "$sum" or op == "sum" {
+            let s = 0
+            for x in nums { s += x }
+            return s
+        }
+        if op == "$avg" or op == "avg" {
+            if len(nums) == 0 { return 0 }
+            let s = 0.0
+            for x in nums { s += x }
+            return DbUtil.roundTo(s / len(nums), 4)
+        }
+        if op == "$min" or op == "min" {
+            if len(vals) == 0 { return null }
+            let best = vals[0]
+            for i in range(1, len(vals)) {
+                if DbUtil.compareValues(vals[i], best) < 0 { best = vals[i] }
+            }
+            return best
+        }
+        if op == "$max" or op == "max" {
+            if len(vals) == 0 { return null }
+            let best = vals[0]
+            for i in range(1, len(vals)) {
+                if DbUtil.compareValues(vals[i], best) > 0 { best = vals[i] }
+            }
+            return best
+        }
+        if op == "$distinct" or op == "distinct" {
+            let uniq = []
+            for v in vals {
+                let seen = false
+                for u in uniq {
+                    if DbUtil.equals(v, u) {
+                        seen = true
+                        break
+                    }
+                }
+                if not seen { uniq.push(v) }
+            }
+            return uniq
+        }
+        return null
+    }
+}
+
+DbQuery = __QDbQuery()
