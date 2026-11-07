@@ -1,0 +1,9 @@
+# database files
+*.db.json
+
+# installed packages
+quantum_qubits/
+node_modules/
+
+# packed releases
+*.tgz
