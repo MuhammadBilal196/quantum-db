@@ -1,0 +1,418 @@
+# quantum-db / util — deep clone, dotted path lookup, multi-key sorting and file helpers
+#
+#   DbUtil.getPath({"user": {"city": "Lahore"}}, "user.city")   # "Lahore"
+#   DbUtil.sortRecords(rows, [{"field": "age", "dir": "desc"}])
+#
+# Exposes the global: DbUtil
+
+class __QDbUtil {
+    fn init() {}
+
+    # ── basic conversions & dict-method safety ───────────────────────────
+
+    fn text(value) {
+        if value == null { return "" }
+        if type(value) == "string" { return value }
+        if type(value) == "bool" or type(value) == "boolean" { return value ? "true" : "false" }
+        if type(value) == "number" and value == floor(value) and value > -1e15 and value < 1e15 {
+            return sprintf("%.0f", value)
+        }
+        return str(value)
+    }
+
+    fn isSpace(ch) {
+        return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+    }
+
+    # Protects dynamic dicts from keys that shadow Quantum's built-in dict methods.
+    fn safeKey(k) {
+        let s = self.text(k)
+        if s == "get" or s == "keys" or s == "values" or s == "has" or s == "remove" or s == "clear" or s == "set" {
+            return "_" + s
+        }
+        return s
+    }
+
+    fn unsafeKey(k) {
+        let s = self.text(k)
+        if len(s) > 1 and s.startsWith("_") {
+            let rest = s.slice(1)
+            if rest == "get" or rest == "keys" or rest == "values" or rest == "has" or rest == "remove" or rest == "clear" or rest == "set" {
+                return rest
+            }
+        }
+        return s
+    }
+
+    fn roundTo(x, decimals) {
+        let factor = 1.0
+        for i in range(decimals) { factor = factor * 10.0 }
+        return floor(x * factor + 0.5) / factor
+    }
+
+    fn minVal(a, b) {
+        return a < b ? a : b
+    }
+
+    fn maxVal(a, b) {
+        return a > b ? a : b
+    }
+
+    fn absVal(x) {
+        return x < 0 ? -x : x
+    }
+
+    # Checks if a string represents a valid integer or decimal number.
+    fn isNumericString(s) {
+        let t = self.text(s).trim()
+        if t == "" { return false }
+        let i = 0
+        if t[0] == "-" or t[0] == "+" {
+            if len(t) == 1 { return false }
+            i = 1
+        }
+        let digits = 0
+        let dots = 0
+        while i < len(t) {
+            let ch = t[i]
+            if ch.isdigit() {
+                digits += 1
+            } else if ch == "." {
+                dots += 1
+                if dots > 1 { return false }
+            } else {
+                return false
+            }
+            i += 1
+        }
+        return digits > 0
+    }
+
+    # Converts a raw string literal (from CSV or SQL) into number, boolean, null, or string.
+    fn autoValue(raw) {
+        if raw == null { return null }
+        if type(raw) != "string" { return raw }
+        let t = raw.trim()
+        let lower = t.lower()
+        if lower == "null" or lower == "nil" { return null }
+        if lower == "true" { return true }
+        if lower == "false" { return false }
+        if self.isNumericString(t) { return num(t) }
+        return raw
+    }
+
+    # ── deep clone & equality ────────────────────────────────────────────
+
+    fn clone(value) {
+        let t = type(value)
+        if t == "array" {
+            let out = []
+            for item in value { out.push(self.clone(item)) }
+            return out
+        }
+        if t == "dict" {
+            let out = {}
+            for k in value.keys() { out[k] = self.clone(value[k]) }
+            return out
+        }
+        return value
+    }
+
+    fn equals(a, b) {
+        let ta = type(a)
+        if ta != type(b) { return false }
+        if ta == "array" {
+            if len(a) != len(b) { return false }
+            for i in range(len(a)) {
+                if not self.equals(a[i], b[i]) { return false }
+            }
+            return true
+        }
+        if ta == "dict" {
+            let ka = a.keys()
+            let kb = b.keys()
+            if len(ka) != len(kb) { return false }
+            for k in ka {
+                if not (k in b) { return false }
+                if not self.equals(a[k], b[k]) { return false }
+            }
+            return true
+        }
+        return a == b
+    }
+
+    fn merge(base, extra) {
+        let out = self.clone(base)
+        if type(out) != "dict" { out = {} }
+        if extra == null or type(extra) != "dict" { return out }
+        for k in extra.keys() {
+            let v = extra[k]
+            if type(v) == "dict" and (k in out) and type(out[k]) == "dict" {
+                out[k] = self.merge(out[k], v)
+            } else {
+                out[k] = self.clone(v)
+            }
+        }
+        return out
+    }
+
+    # ── dotted path access ("profile.address.city") ──────────────────────
+
+    fn getPath(obj, path) {
+        if obj == null or type(obj) != "dict" { return null }
+        let p = self.text(path)
+        if p in obj { return obj[p] }
+        if not p.contains(".") { return null }
+        let cur = obj
+        for part in p.split(".") {
+            if cur == null or type(cur) != "dict" or not (part in cur) {
+                return null
+            }
+            cur = cur[part]
+        }
+        return cur
+    }
+
+    fn hasPath(obj, path) {
+        if obj == null or type(obj) != "dict" { return false }
+        let p = self.text(path)
+        if p in obj { return true }
+        if not p.contains(".") { return false }
+        let cur = obj
+        for part in p.split(".") {
+            if cur == null or type(cur) != "dict" or not (part in cur) {
+                return false
+            }
+            cur = cur[part]
+        }
+        return true
+    }
+
+    fn setPath(obj, path, value) {
+        if obj == null or type(obj) != "dict" { return obj }
+        let p = self.text(path)
+        if not p.contains(".") {
+            obj[p] = value
+            return obj
+        }
+        let parts = p.split(".")
+        let cur = obj
+        let n = len(parts)
+        for i in range(n - 1) {
+            let key = parts[i]
+            if not (key in cur) or type(cur[key]) != "dict" {
+                cur[key] = {}
+            }
+            cur = cur[key]
+        }
+        cur[parts[n - 1]] = value
+        return obj
+    }
+
+    # ── comparison & sorting ─────────────────────────────────────────────
+
+    # Returns -1 if a < b, 0 if a == b, 1 if a > b. Nulls sort first.
+    fn compareValues(a, b) {
+        if a == null and b == null { return 0 }
+        if a == null { return -1 }
+        if b == null { return 1 }
+        let ta = type(a)
+        let tb = type(b)
+        if ta == "number" and tb == "number" {
+            if a < b { return -1 }
+            if a > b { return 1 }
+            return 0
+        }
+        if (ta == "bool" or ta == "boolean") and (tb == "bool" or tb == "boolean") {
+            if a == b { return 0 }
+            return a ? 1 : -1
+        }
+        let sa = self.text(a)
+        let sb = self.text(b)
+        if sa < sb { return -1 }
+        if sa > sb { return 1 }
+        return 0
+    }
+
+    # Normalizes orderBy spec into [{"field": "age", "desc": true}, ...].
+    # Accepts: "age", "-age", "age:desc", ["age:desc", "name:asc"], or [{"field": "age", "dir": "desc"}].
+    fn normalizeOrderSpec(spec) {
+        let out = []
+        if spec == null { return out }
+        if type(spec) == "string" {
+            for part in spec.split(",") {
+                let p = part.trim()
+                if p != "" { out.push(self.parseSingleOrder(p)) }
+            }
+            return out
+        }
+        if type(spec) == "dict" {
+            if "field" in spec {
+                let d = self.text(spec.get("dir", spec.get("order", "asc"))).lower()
+                out.push({"field": spec["field"], "desc": d == "desc" or spec.get("desc", false) == true})
+            } else {
+                for k in spec.keys() {
+                    let v = self.text(spec[k]).lower()
+                    out.push({"field": k, "desc": v == "desc" or v == "-1"})
+                }
+            }
+            return out
+        }
+        if type(spec) == "array" {
+            for item in spec {
+                if type(item) == "string" {
+                    out.push(self.parseSingleOrder(item))
+                } else if type(item) == "dict" and ("field" in item) {
+                    let d = self.text(item.get("dir", item.get("order", "asc"))).lower()
+                    out.push({"field": item["field"], "desc": d == "desc" or item.get("desc", false) == true})
+                }
+            }
+        }
+        return out
+    }
+
+    fn parseSingleOrder(s) {
+        let t = s.trim()
+        if t.startsWith("-") {
+            return {"field": t.slice(1).trim(), "desc": true}
+        }
+        if t.startsWith("+") {
+            return {"field": t.slice(1).trim(), "desc": false}
+        }
+        let colon = t.indexOf(":")
+        if colon > 0 {
+            let f = t.slice(0, colon).trim()
+            let dir = t.slice(colon + 1).trim().lower()
+            return {"field": f, "desc": dir == "desc"}
+        }
+        let space = t.indexOf(" ")
+        if space > 0 {
+            let f = t.slice(0, space).trim()
+            let dir = t.slice(space + 1).trim().lower()
+            return {"field": f, "desc": dir == "desc"}
+        }
+        return {"field": t, "desc": false}
+    }
+
+    # Stable merge-insertion sort for an array of record dicts by multi-field orderSpec.
+    fn sortRecords(records, orderSpec) {
+        let rules = self.normalizeOrderSpec(orderSpec)
+        let n = len(records)
+        if n <= 1 or len(rules) == 0 { return self.clone(records) }
+
+        let out = []
+        for i in range(n) { out.push(records[i]) }
+
+        # Shell/insertion sort with multi-key comparator (preserves relative order on ties)
+        let i = 1
+        while i < n {
+            let item = out[i]
+            let j = i - 1
+            while j >= 0 and self.compareRecords(out[j], item, rules) > 0 {
+                out[j + 1] = out[j]
+                j -= 1
+            }
+            out[j + 1] = item
+            i += 1
+        }
+        return out
+    }
+
+    fn compareRecords(a, b, rules) {
+        for r in rules {
+            let f = r["field"]
+            let va = self.getPath(a, f)
+            let vb = self.getPath(b, f)
+            let cmp = self.compareValues(va, vb)
+            if cmp != 0 {
+                return r["desc"] ? -cmp : cmp
+            }
+        }
+        return 0
+    }
+
+    fn sortStrings(items) {
+        let copy = []
+        for x in items { copy.push(self.text(x)) }
+        copy.sort()
+        return copy
+    }
+
+    # ── paths & files ────────────────────────────────────────────────────
+
+    fn normalizePath(p) {
+        let s = self.text(p).replaceAll("\\", "/")
+        while s.contains("//") { s = s.replaceAll("//", "/") }
+        return s
+    }
+
+    fn lastIndex(s, ch) {
+        let i = len(s) - 1
+        while i >= 0 {
+            if s[i] == ch { return i }
+            i -= 1
+        }
+        return -1
+    }
+
+    fn dirOf(p) {
+        let s = self.normalizePath(p)
+        let i = self.lastIndex(s, "/")
+        if i < 0 { return "" }
+        return s.slice(0, i)
+    }
+
+    fn fileOf(p) {
+        let s = self.normalizePath(p)
+        return s.slice(self.lastIndex(s, "/") + 1)
+    }
+
+    fn extOf(p) {
+        let name = self.fileOf(p)
+        let i = self.lastIndex(name, ".")
+        if i <= 0 { return "" }
+        return name.slice(i).lower()
+    }
+
+    fn liftStepLimit() {
+        let lifted = false
+        try {
+            __cpp_runtime__()
+            lifted = true
+        } catch (e) {
+            lifted = false
+        }
+        return lifted
+    }
+
+    fn ensureDir(path) {
+        let p = self.normalizePath(path)
+        if p == "" or p == "." { return true }
+        if p.endsWith("/") { p = p.slice(0, len(p) - 1) }
+        if os.path.isdir(p) { return true }
+        let made = false
+        try {
+            made = __q_fs_mkdirs(p)
+        } catch (e) {
+            made = false
+        }
+        if os.path.isdir(p) { return true }
+        raise "cannot create folder " + p
+    }
+
+    fn readText(path) {
+        let content = read_file(path)
+        if content == null { raise "cannot read " + path }
+        return content
+    }
+
+    fn writeText(path, content) {
+        self.ensureDir(self.dirOf(path))
+        if not write_file(path, content) {
+            raise "cannot write " + path
+        }
+        return true
+    }
+}
+
+DbUtil = __QDbUtil()
