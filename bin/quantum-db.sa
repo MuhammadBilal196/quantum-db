@@ -1,0 +1,243 @@
+# quantum-db — command-line entry point
+#
+#   qrun quantum-db-cli.sa init [store.db.json] [--sample]
+#   qrun quantum-db-cli.sa sql "SELECT name, role, age FROM users WHERE age >= 25 ORDER BY age DESC"
+#   qrun quantum-db-cli.sa query users [--where '{"role":"admin"}'] [--sort age:desc] [--format table|md|csv|json]
+#   qrun quantum-db-cli.sa insert users '{"name":"Zayd","email":"zayd@quantum.dev","age":27}' --db store.db.json
+#   qrun quantum-db-cli.sa import users data.csv --db store.db.json
+#   qrun quantum-db-cli.sa export users --format csv --out users.csv
+#   qrun quantum-db-cli.sa stats [--db store.db.json]
+#   qrun quantum-db-cli.sa demo
+#   qrun quantum-db-cli.sa help | version
+#
+# dist/quantum-db-cli.sa is this file bundled with the library; rebuild it after
+# changing src/.
+
+# @use ../index.sa
+
+fn __qdbFail(message) {
+    raise "[quantum-db] " + message
+}
+
+fn __qdbUsage() {
+    return [
+        "quantum-db " + Db.VERSION + " - embedded document & SQL database engine for Quantum",
+        "",
+        "usage: qrun quantum-db-cli.sa <command> [options]",
+        "",
+        "  init [file.db.json] [--sample]                create a database file (optionally with sample tables)",
+        "  sql \"SELECT ...\" [--db FILE] [--format FMT]   run SQL (SELECT, INSERT, UPDATE, DELETE, CREATE, JOIN)",
+        "  query <collection> [--db FILE]                query a collection",
+        "        [--where JSON] [--sort field:desc] [--limit N] [--format table|md|csv|json]",
+        "  insert <collection> <json-doc> [--db FILE]    insert a JSON document into a collection",
+        "  import <collection> <file.csv> [--db FILE]    import rows from a CSV or JSONL file",
+        "  export <collection> [--db FILE] [--out FILE]  export a collection as table, md, csv, json or jsonl",
+        "  stats [--db FILE]                             show collections, row counts and indexes",
+        "  demo                                          run a showcase of SQL, joins, aggregations and tables",
+        "  help                                          show this help",
+        "  version                                       print the version"
+    ].join("\n")
+}
+
+fn __qdbArgs(argv) {
+    let positional = []
+    let flags = {}
+    let boolFlags = ["sample", "json", "help", "version"]
+    let k = 0
+    while k < len(argv) {
+        let a = argv[k]
+        if a.startsWith("--") {
+            let name = a.slice(2)
+            let eq = name.indexOf("=")
+            if eq > 0 {
+                flags[name.slice(0, eq)] = name.slice(eq + 1)
+            } else if boolFlags.contains(name) {
+                flags[name] = true
+            } else if k + 1 < len(argv) and not argv[k + 1].startsWith("--") {
+                flags[name] = argv[k + 1]
+                k += 1
+            } else {
+                flags[name] = true
+            }
+        } else if a == "-h" {
+            flags["help"] = true
+        } else if a == "-v" {
+            flags["version"] = true
+        } else {
+            positional.push(a)
+        }
+        k += 1
+    }
+    return {"positional": positional, "flags": flags}
+}
+
+fn __qdbLoad(flags) {
+    let dbPath = DbUtil.text(flags.get("db", "quantum.db.json"))
+    if os.path.exists(dbPath) {
+        return {"db": Db.open(dbPath), "path": dbPath, "persisted": true}
+    }
+    if "db" in flags {
+        return {"db": Db.create({"name": DbUtil.fileOf(dbPath)}), "path": dbPath, "persisted": true}
+    }
+    return {"db": Db.sampleDatabase(), "path": "", "persisted": false}
+}
+
+fn __qdbRenderRows(rows, flags) {
+    let fmt = DbUtil.text(flags.get("format", flags.get("json", false) == true ? "json" : "table")).lower()
+    if fmt == "json" { return JSON.stringify(rows) }
+    if fmt == "jsonl" { return DbFormat.jsonl(rows) }
+    if fmt == "csv" { return DbFormat.csv(rows, null) }
+    if fmt == "md" or fmt == "markdown" { return DbFormat.markdown(rows, null) }
+    return DbFormat.table(rows, null)
+}
+
+fn __qdbRunDemo() {
+    let db = Db.sampleDatabase()
+    let st = Db.stats(db)
+    print("quantum-db " + Db.VERSION + " demo — database '" + st["name"] + "' ("
+        + str(st["collectionCount"]) + " collections, " + str(st["totalRows"]) + " total rows)")
+    print("")
+
+    let q1 = "SELECT id, name, role, city, age FROM users WHERE age >= 25 ORDER BY age DESC"
+    print("1) SQL Filter & Sort: " + q1)
+    print(DbFormat.table(Db.sql(db, q1), ["id", "name", "role", "city", "age"]))
+    print("")
+
+    let q2 = "SELECT role, COUNT(*) AS members, AVG(age) AS avg_age FROM users GROUP BY role ORDER BY members DESC"
+    print("2) SQL GROUP BY & Aggregation: " + q2)
+    print(DbFormat.table(Db.sql(db, q2), ["role", "members", "avg_age"]))
+    print("")
+
+    let q3 = "SELECT name, item, amount, status FROM users INNER JOIN orders ON users.id = orders.userId ORDER BY amount DESC"
+    print("3) SQL INNER JOIN across collections: " + q3)
+    print(DbFormat.table(Db.sql(db, q3), ["name", "item", "amount", "status"]))
+}
+
+fn __qdbMain() {
+    let argv = []
+    if sys.argv != null and len(sys.argv) > 1 { argv = sys.argv.slice(1) }
+    let parsed = __qdbArgs(argv)
+    let pos = parsed["positional"]
+    let flags = parsed["flags"]
+    let command = len(pos) > 0 ? pos[0] : ""
+
+    if flags.get("help", false) == true or command == "help" {
+        print(__qdbUsage())
+        return
+    }
+    if flags.get("version", false) == true or command == "version" {
+        print("quantum-db " + Db.VERSION)
+        return
+    }
+    if command == "" or command == "demo" {
+        __qdbRunDemo()
+        return
+    }
+    if command == "init" {
+        let target = len(pos) > 1 ? pos[1] : DbUtil.text(flags.get("db", "quantum.db.json"))
+        let db = flags.get("sample", false) == true ? Db.sampleDatabase() : Db.create({"name": DbUtil.fileOf(target)})
+        Db.save(db, target)
+        let st = Db.stats(db)
+        print("[quantum-db] initialized " + target + " (" + str(st["collectionCount"]) + " collection(s), " + str(st["totalRows"]) + " row(s))")
+        return
+    }
+    if command == "sql" {
+        if len(pos) < 2 { __qdbFail("usage: sql \"SELECT ...\" [--db file.db.json]") }
+        let sqlText = pos.slice(1).join(" ")
+        let loaded = __qdbLoad(flags)
+        let db = loaded["db"]
+        let result = Db.sql(db, sqlText)
+        if type(result) == "array" {
+            print(__qdbRenderRows(result, flags))
+        } else {
+            if loaded["persisted"] and loaded["path"] != "" {
+                Db.save(db, loaded["path"])
+            }
+            print("[quantum-db] " + JSON.stringify(result))
+        }
+        return
+    }
+    if command == "query" or command == "find" {
+        if len(pos) < 2 { __qdbFail("usage: query <collection> [--where '{...}'] [--sort field:desc]") }
+        let colName = pos[1]
+        let loaded = __qdbLoad(flags)
+        let qSpec = {}
+        if "where" in flags and flags["where"] != true {
+            qSpec["where"] = JSON.parse(flags["where"])
+        }
+        if "sort" in flags and flags["sort"] != true {
+            qSpec["orderBy"] = flags["sort"]
+        }
+        if "limit" in flags and flags["limit"] != true {
+            qSpec["limit"] = num(flags["limit"])
+        }
+        let rows = Db.find(loaded["db"], colName, qSpec)
+        print(__qdbRenderRows(rows, flags))
+        return
+    }
+    if command == "insert" {
+        if len(pos) < 3 { __qdbFail("usage: insert <collection> '<json-doc>' [--db file.db.json]") }
+        let colName = pos[1]
+        let rawJson = pos.slice(2).join(" ")
+        let doc = JSON.parse(rawJson)
+        let dbPath = DbUtil.text(flags.get("db", "quantum.db.json"))
+        let db = Db.open(dbPath)
+        let inserted = Db.insert(db, colName, doc)
+        Db.save(db, dbPath)
+        print("[quantum-db] inserted into " + colName + " (" + dbPath + "): " + JSON.stringify(inserted))
+        return
+    }
+    if command == "import" {
+        if len(pos) < 3 { __qdbFail("usage: import <collection> <file.csv|file.jsonl> [--db file.db.json]") }
+        let colName = pos[1]
+        let srcFile = pos[2]
+        let dbPath = DbUtil.text(flags.get("db", "quantum.db.json"))
+        let db = Db.open(dbPath)
+        let content = DbUtil.readText(srcFile)
+        let ext = DbUtil.extOf(srcFile)
+        let imported = []
+        if ext == ".jsonl" {
+            imported = Db.insertMany(db, colName, DbFormat.parseJsonl(content))
+        } else if ext == ".json" {
+            let parsedJson = JSON.parse(content)
+            imported = Db.insertMany(db, colName, type(parsedJson) == "array" ? parsedJson : [parsedJson])
+        } else {
+            imported = Db.importCsv(db, colName, content, {"autoTypes": true})
+        }
+        Db.save(db, dbPath)
+        print("[quantum-db] imported " + str(len(imported)) + " row(s) into " + colName + " (" + dbPath + ")")
+        return
+    }
+    if command == "export" {
+        if len(pos) < 2 { __qdbFail("usage: export <collection> [--format csv|md|json|table] [--out file]") }
+        let colName = pos[1]
+        let loaded = __qdbLoad(flags)
+        let rows = Db.find(loaded["db"], colName, {})
+        let rendered = __qdbRenderRows(rows, flags)
+        if "out" in flags and flags["out"] != true {
+            DbUtil.writeText(flags["out"], rendered)
+            print("[quantum-db] exported " + str(len(rows)) + " row(s) from " + colName + " to " + flags["out"])
+        } else {
+            print(rendered)
+        }
+        return
+    }
+    if command == "stats" {
+        let loaded = __qdbLoad(flags)
+        let st = Db.stats(loaded["db"])
+        if flags.get("json", false) == true {
+            print(JSON.stringify(st))
+            return
+        }
+        print("[quantum-db] database '" + st["name"] + "' (" + str(st["collectionCount"]) + " collections, " + str(st["totalRows"]) + " total rows)")
+        for c in st["collections"] {
+            let idxText = len(c["indexes"]) > 0 ? " indexes=[" + c["indexes"].join(", ") + "]" : ""
+            print("  - " + c["name"] + ": " + str(c["rowCount"]) + " rows (pk=" + c["primaryKey"] + ")" + idxText)
+        }
+        return
+    }
+
+    __qdbFail("unknown command '" + command + "'\n\n" + __qdbUsage())
+}
+
+__qdbMain()
