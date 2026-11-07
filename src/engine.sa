@@ -1,0 +1,593 @@
+# quantum-db / engine — embedded multi-collection database, indexes, CRUD, transactions & SQL
+#
+#   let db = Db.create({"name": "shop"})
+#   Db.insert(db, "users", {"name": "Ada", "role": "admin", "age": 28})
+#   let admins = Db.find(db, "users", {"where": {"role": "admin"}, "orderBy": "age:desc"})
+#   let rows   = Db.sql(db, "SELECT name, age FROM users WHERE age >= 21")
+#
+# Exposes the global: Db
+
+class __QDbEngine {
+    fn init() {
+        self.VERSION = "1.0.0"
+    }
+
+    # Creates a new in-memory database dict.
+    fn create(options) {
+        let name = options != null ? DbUtil.text(options.get("name", "quantum-db")) : "quantum-db"
+        return {
+            "version": self.VERSION,
+            "name": name,
+            "collections": {},
+            "snapshots": []
+        }
+    }
+
+    # Creates or configures a collection inside `db`.
+    # options: "primaryKey" (default "id"), "autoIncrement" (default true),
+    #          "schema" (dict), "unique" (array of field names), "indexes" (array of field names)
+    fn createCollection(db, name, options) {
+        let colName = DbUtil.text(name).trim()
+        if colName == "" { raise "collection name cannot be empty" }
+        let sk = DbUtil.safeKey(colName)
+        if sk in db["collections"] {
+            return db["collections"][sk]
+        }
+
+        let pk = options != null ? DbUtil.text(options.get("primaryKey", "id")) : "id"
+        let autoInc = options == null or options.get("autoIncrement", true) == true
+        let rawSchema = options != null ? options.get("schema", {}) : {}
+        let schema = DbSchema.normalize(rawSchema)
+
+        let col = {
+            "name": colName,
+            "primaryKey": pk,
+            "autoIncrement": autoInc,
+            "nextId": 1,
+            "schema": schema,
+            "rows": {},
+            "order": [],
+            "indexes": {}
+        }
+        db["collections"][sk] = col
+
+        if options != null {
+            let uniques = options.get("unique", [])
+            if type(uniques) == "array" {
+                for uField in uniques { self.createIndex(db, colName, uField, true) }
+            }
+            let idxFields = options.get("indexes", [])
+            if type(idxFields) == "array" {
+                for iField in idxFields { self.createIndex(db, colName, iField, false) }
+            }
+        }
+        return col
+    }
+
+    fn ensureCollection(db, name) {
+        let sk = DbUtil.safeKey(DbUtil.text(name).trim())
+        if sk in db["collections"] { return db["collections"][sk] }
+        return self.createCollection(db, name, {})
+    }
+
+    fn hasCollection(db, name) {
+        return DbUtil.safeKey(DbUtil.text(name).trim()) in db["collections"]
+    }
+
+    fn dropCollection(db, name) {
+        let sk = DbUtil.safeKey(DbUtil.text(name).trim())
+        if not (sk in db["collections"]) { return false }
+        let kept = {}
+        for k in db["collections"].keys() {
+            if k != sk { kept[k] = db["collections"][k] }
+        }
+        db["collections"] = kept
+        return true
+    }
+
+    fn listCollections(db) {
+        let names = []
+        for k in db["collections"].keys() {
+            names.push(db["collections"][k]["name"])
+        }
+        return DbUtil.sortStrings(names)
+    }
+
+    # ── Secondary & Unique Hash Indexes ──────────────────────────────────
+
+    fn createIndex(db, collectionName, field, unique) {
+        let col = self.ensureCollection(db, collectionName)
+        let f = DbUtil.text(field).trim()
+        let fKey = DbUtil.safeKey(f)
+        let isUnique = unique == true
+        col["indexes"][fKey] = {
+            "field": f,
+            "unique": isUnique,
+            "buckets": {}
+        }
+        self.rebuildIndex(col, fKey)
+        return true
+    }
+
+    fn rebuildIndex(col, fKey) {
+        let idxDef = col["indexes"][fKey]
+        let field = idxDef["field"]
+        let isUnique = idxDef["unique"]
+        let buckets = {}
+
+        for pkKey in col["order"] {
+            let doc = col["rows"][pkKey]
+            let val = DbUtil.getPath(doc, field)
+            if val == null { continue }
+            let valKey = DbUtil.safeKey(DbUtil.text(val))
+            if isUnique and (valKey in buckets) and len(buckets[valKey]) > 0 {
+                raise "unique constraint violated on " + col["name"] + "." + field + " = " + DbUtil.text(val)
+            }
+            if not (valKey in buckets) { buckets[valKey] = [] }
+            buckets[valKey].push(pkKey)
+        }
+        idxDef["buckets"] = buckets
+    }
+
+    fn rebuildAllIndexes(col) {
+        for fKey in col["indexes"].keys() {
+            self.rebuildIndex(col, fKey)
+        }
+    }
+
+    fn checkUniqueConstraints(col, candidateDoc, ignorePkKey) {
+        for fKey in col["indexes"].keys() {
+            let idxDef = col["indexes"][fKey]
+            if not idxDef["unique"] { continue }
+            let field = idxDef["field"]
+            let val = DbUtil.getPath(candidateDoc, field)
+            if val == null { continue }
+            let valKey = DbUtil.safeKey(DbUtil.text(val))
+            let buckets = idxDef["buckets"]
+            if valKey in buckets {
+                for existingPk in buckets[valKey] {
+                    if existingPk != ignorePkKey {
+                        raise "unique constraint violated on " + col["name"] + "." + field + " = " + DbUtil.text(val)
+                    }
+                }
+            }
+        }
+    }
+
+    # ── CRUD: Insert, Get, Find, Update, Remove ──────────────────────────
+
+    fn insert(db, collectionName, rawDoc) {
+        let col = self.ensureCollection(db, collectionName)
+        let pkField = col["primaryKey"]
+        let doc = DbSchema.prepare(col["schema"], rawDoc)
+
+        let nextIdCandidate = col["nextId"]
+        if not (pkField in doc) or doc[pkField] == null or doc[pkField] == "" {
+            if col["autoIncrement"] {
+                while DbUtil.safeKey(DbUtil.text(nextIdCandidate)) in col["rows"] {
+                    nextIdCandidate = nextIdCandidate + 1
+                }
+                doc[pkField] = nextIdCandidate
+                nextIdCandidate = nextIdCandidate + 1
+            } else {
+                raise "missing primary key '" + pkField + "' on insert into " + col["name"]
+            }
+        } else if type(doc[pkField]) == "number" and doc[pkField] >= nextIdCandidate {
+            nextIdCandidate = floor(doc[pkField]) + 1
+        }
+
+        let pkKey = DbUtil.safeKey(DbUtil.text(doc[pkField]))
+        if pkKey in col["rows"] {
+            raise "duplicate primary key '" + DbUtil.text(doc[pkField]) + "' in " + col["name"]
+        }
+
+        DbSchema.assertValid(col["schema"], doc)
+        self.checkUniqueConstraints(col, doc, "")
+
+        col["nextId"] = nextIdCandidate
+        col["rows"][pkKey] = doc
+        col["order"].push(pkKey)
+        self.rebuildAllIndexes(col)
+        return DbUtil.clone(doc)
+    }
+
+    fn insertMany(db, collectionName, docs) {
+        let out = []
+        for d in docs { out.push(self.insert(db, collectionName, d)) }
+        return out
+    }
+
+    fn get(db, collectionName, id) {
+        if not self.hasCollection(db, collectionName) { return null }
+        let col = self.ensureCollection(db, collectionName)
+        let pkKey = DbUtil.safeKey(DbUtil.text(id))
+        if not (pkKey in col["rows"]) { return null }
+        return DbUtil.clone(col["rows"][pkKey])
+    }
+
+    fn has(db, collectionName, id) {
+        if not self.hasCollection(db, collectionName) { return false }
+        let col = self.ensureCollection(db, collectionName)
+        let pkKey = DbUtil.safeKey(DbUtil.text(id))
+        return pkKey in col["rows"]
+    }
+
+    fn count(db, collectionName, whereSpec) {
+        if not self.hasCollection(db, collectionName) { return 0 }
+        let col = self.ensureCollection(db, collectionName)
+        if whereSpec == null or (type(whereSpec) == "dict" and len(whereSpec.keys()) == 0) {
+            return len(col["order"])
+        }
+        return len(self.matchingRows(col, whereSpec))
+    }
+
+    # Uses secondary hash index when `whereSpec` has an exact equality on an indexed field.
+    fn matchingRows(col, whereSpec) {
+        let candidateKeys = col["order"]
+        if whereSpec != null and type(whereSpec) == "dict" {
+            let pkField = col["primaryKey"]
+            if (pkField in whereSpec) and not DbQuery.isOperatorDict(whereSpec[pkField]) {
+                let pkKey = DbUtil.safeKey(DbUtil.text(whereSpec[pkField]))
+                candidateKeys = (pkKey in col["rows"]) ? [pkKey] : []
+            } else {
+                for k in whereSpec.keys() {
+                    if k.startsWith("$") { continue }
+                    let cond = whereSpec[k]
+                    if not DbQuery.isOperatorDict(cond) and cond != null {
+                        let fKey = DbUtil.safeKey(k)
+                        if fKey in col["indexes"] {
+                            let buckets = col["indexes"][fKey]["buckets"]
+                            let vKey = DbUtil.safeKey(DbUtil.text(cond))
+                            candidateKeys = (vKey in buckets) ? buckets[vKey] : []
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        let matched = []
+        for pkKey in candidateKeys {
+            let doc = col["rows"][pkKey]
+            if DbQuery.matches(doc, whereSpec) {
+                matched.push(DbUtil.clone(doc))
+            }
+        }
+        return matched
+    }
+
+    # Executes a rich query against `collectionName`.
+    # querySpec: {
+    #   "where": {...}, "join": {...}, "groupBy": ..., "metrics": {...}, "having": {...},
+    #   "orderBy" / "sort": ..., "offset": 0, "limit": 0, "select": [...]
+    # }
+    fn find(db, collectionName, querySpec) {
+        DbUtil.liftStepLimit()
+        if not self.hasCollection(db, collectionName) { return [] }
+        let col = self.ensureCollection(db, collectionName)
+        let q = querySpec != null ? querySpec : {}
+
+        let whereSpec = q.get("where", null)
+        # Allow passing a plain filter dict directly as querySpec when no reserved keys are present
+        if whereSpec == null and not ("select" in q) and not ("orderBy" in q) and not ("sort" in q) and not ("limit" in q) and not ("offset" in q) and not ("join" in q) and not ("groupBy" in q) and not ("metrics" in q) {
+            whereSpec = q
+        }
+
+        let hasJoin = "join" in q and q["join"] != null
+        let rows = self.matchingRows(col, hasJoin ? null : whereSpec)
+
+        # Optional JOIN
+        if hasJoin {
+            let jSpec = q["join"]
+            let rightRows = []
+            if "right" in jSpec and type(jSpec["right"]) == "array" {
+                rightRows = jSpec["right"]
+            } else if "table" in jSpec or "collection" in jSpec {
+                let targetCol = jSpec.get("table", jSpec.get("collection", ""))
+                rightRows = self.find(db, targetCol, {})
+            }
+            rows = DbQuery.executeJoin(rows, rightRows, jSpec)
+            if whereSpec != null {
+                let filtered = []
+                for r in rows {
+                    if DbQuery.matches(r, whereSpec) { filtered.push(r) }
+                }
+                rows = filtered
+            }
+        }
+
+        # Optional GROUP BY / Metrics Aggregation
+        if ("groupBy" in q and q["groupBy"] != null) or ("metrics" in q and q["metrics"] != null) {
+            rows = DbQuery.aggregate(rows, {
+                "groupBy": q.get("groupBy", []),
+                "metrics": q.get("metrics", {"count": {"$count": "*"}}),
+                "having": q.get("having", null)
+            })
+        }
+
+        # Optional ORDER BY / sort
+        let orderSpec = q.get("orderBy", q.get("sort", null))
+        if orderSpec != null {
+            rows = DbUtil.sortRecords(rows, orderSpec)
+        }
+
+        # Optional OFFSET & LIMIT
+        let offset = q.get("offset", 0)
+        if type(offset) == "number" and offset > 0 {
+            if offset >= len(rows) { return [] }
+            rows = rows.slice(offset)
+        }
+        let limit = q.get("limit", 0)
+        if type(limit) == "number" and limit > 0 and len(rows) > limit {
+            rows = rows.slice(0, limit)
+        }
+
+        # Optional SELECT projection
+        if "select" in q and q["select"] != null {
+            rows = DbQuery.project(rows, q["select"])
+        }
+
+        return rows
+    }
+
+    fn findOne(db, collectionName, whereSpec) {
+        let hits = self.find(db, collectionName, {"where": whereSpec, "limit": 1})
+        if len(hits) == 0 { return null }
+        return hits[0]
+    }
+
+    fn update(db, collectionName, whereSpec, changes) {
+        if not self.hasCollection(db, collectionName) { return 0 }
+        let col = self.ensureCollection(db, collectionName)
+        let pkField = col["primaryKey"]
+        let updatedCount = 0
+
+        for pkKey in col["order"] {
+            let doc = col["rows"][pkKey]
+            if DbQuery.matches(doc, whereSpec) {
+                let updatedDoc = DbQuery.applyChanges(doc, changes)
+                updatedDoc[pkField] = doc[pkField]
+                DbSchema.assertValid(col["schema"], updatedDoc)
+                self.checkUniqueConstraints(col, updatedDoc, pkKey)
+                col["rows"][pkKey] = updatedDoc
+                updatedCount += 1
+            }
+        }
+        if updatedCount > 0 {
+            self.rebuildAllIndexes(col)
+        }
+        return updatedCount
+    }
+
+    fn updateById(db, collectionName, id, changes) {
+        if not self.hasCollection(db, collectionName) { return null }
+        let col = self.ensureCollection(db, collectionName)
+        let pkKey = DbUtil.safeKey(DbUtil.text(id))
+        if not (pkKey in col["rows"]) { return null }
+        let doc = col["rows"][pkKey]
+        let pkField = col["primaryKey"]
+        let updatedDoc = DbQuery.applyChanges(doc, changes)
+        updatedDoc[pkField] = doc[pkField]
+        DbSchema.assertValid(col["schema"], updatedDoc)
+        self.checkUniqueConstraints(col, updatedDoc, pkKey)
+        col["rows"][pkKey] = updatedDoc
+        self.rebuildAllIndexes(col)
+        return DbUtil.clone(updatedDoc)
+    }
+
+    fn upsert(db, collectionName, whereSpec, docOrChanges) {
+        let existing = self.findOne(db, collectionName, whereSpec)
+        if existing != null {
+            let col = self.ensureCollection(db, collectionName)
+            let pk = existing[col["primaryKey"]]
+            return self.updateById(db, collectionName, pk, docOrChanges)
+        }
+        return self.insert(db, collectionName, docOrChanges)
+    }
+
+    fn remove(db, collectionName, whereSpec) {
+        if not self.hasCollection(db, collectionName) { return 0 }
+        let col = self.ensureCollection(db, collectionName)
+        let keptOrder = []
+        let keptRows = {}
+        let removedCount = 0
+
+        for pkKey in col["order"] {
+            let doc = col["rows"][pkKey]
+            if DbQuery.matches(doc, whereSpec) {
+                removedCount += 1
+            } else {
+                keptOrder.push(pkKey)
+                keptRows[pkKey] = doc
+            }
+        }
+        if removedCount > 0 {
+            col["order"] = keptOrder
+            col["rows"] = keptRows
+            self.rebuildAllIndexes(col)
+        }
+        return removedCount
+    }
+
+    fn removeById(db, collectionName, id) {
+        if not self.hasCollection(db, collectionName) { return false }
+        let col = self.ensureCollection(db, collectionName)
+        let pkKey = DbUtil.safeKey(DbUtil.text(id))
+        if not (pkKey in col["rows"]) { return false }
+        let whereSpec = {}
+        whereSpec[col["primaryKey"]] = col["rows"][pkKey][col["primaryKey"]]
+        return self.remove(db, collectionName, whereSpec) > 0
+    }
+
+    fn clear(db, collectionName) {
+        if not self.hasCollection(db, collectionName) { return 0 }
+        let col = self.ensureCollection(db, collectionName)
+        let n = len(col["order"])
+        col["rows"] = {}
+        col["order"] = []
+        col["nextId"] = 1
+        self.rebuildAllIndexes(col)
+        return n
+    }
+
+    # ── Transactions (Snapshot Isolation) ────────────────────────────────
+
+    fn begin(db) {
+        let snap = DbUtil.clone(db["collections"])
+        db["snapshots"].push(snap)
+        return len(db["snapshots"])
+    }
+
+    fn commit(db) {
+        let n = len(db["snapshots"])
+        if n == 0 { raise "no active transaction to commit" }
+        db["snapshots"].pop()
+        return true
+    }
+
+    fn rollback(db) {
+        let n = len(db["snapshots"])
+        if n == 0 { raise "no active transaction to roll back" }
+        let snap = db["snapshots"].pop()
+        db["collections"] = snap
+        return true
+    }
+
+    fn transaction(db, action) {
+        self.begin(db)
+        let result = null
+        let err = ""
+        try {
+            result = action()
+        } catch (e) {
+            err = str(e)
+        }
+        if err != "" {
+            self.rollback(db)
+            raise err
+        }
+        self.commit(db)
+        return result
+    }
+
+    # ── SQL, CSV Import/Export, Persistence & Stats ──────────────────────
+
+    fn sql(db, sqlText) {
+        return DbSql.execute(db, sqlText)
+    }
+
+    fn importCsv(db, collectionName, csvText, options) {
+        let rows = DbFormat.parseCsv(csvText, options)
+        return self.insertMany(db, collectionName, rows)
+    }
+
+    fn exportCsv(db, collectionName, querySpec) {
+        let rows = self.find(db, collectionName, querySpec)
+        return DbFormat.csv(rows, null)
+    }
+
+    fn stats(db) {
+        let colStats = []
+        let totalRows = 0
+        for name in self.listCollections(db) {
+            let col = self.ensureCollection(db, name)
+            let count = len(col["order"])
+            totalRows += count
+            let idxNames = []
+            for ik in col["indexes"].keys() {
+                idxNames.push(col["indexes"][ik]["field"])
+            }
+            colStats.push({
+                "name": name,
+                "rowCount": count,
+                "primaryKey": col["primaryKey"],
+                "nextId": col["nextId"],
+                "indexes": idxNames,
+                "schemaFields": col["schema"].keys()
+            })
+        }
+        return {
+            "version": db.get("version", self.VERSION),
+            "name": db.get("name", "quantum-db"),
+            "collectionCount": len(colStats),
+            "totalRows": totalRows,
+            "collections": colStats
+        }
+    }
+
+    fn toJSON(db) {
+        let clean = {
+            "version": db.get("version", self.VERSION),
+            "name": db.get("name", "quantum-db"),
+            "collections": db["collections"]
+        }
+        return JSON.stringify(clean)
+    }
+
+    fn fromJSON(jsonText) {
+        let parsed = JSON.parse(jsonText)
+        if type(parsed) != "dict" or not ("collections" in parsed) {
+            raise "invalid quantum-db JSON file"
+        }
+        parsed["snapshots"] = []
+        return parsed
+    }
+
+    fn save(db, filePath) {
+        DbUtil.writeText(filePath, self.toJSON(db))
+        return filePath
+    }
+
+    fn open(filePath) {
+        if not os.path.exists(filePath) {
+            return self.create({"name": DbUtil.fileOf(filePath)})
+        }
+        let raw = DbUtil.readText(filePath)
+        return self.fromJSON(raw)
+    }
+
+    # Built-in sample relational/document database (`users`, `products`, `orders`)
+    fn sampleDatabase() {
+        let db = self.create({"name": "quantum-store"})
+        self.createCollection(db, "users", {
+            "primaryKey": "id",
+            "unique": ["email"],
+            "indexes": ["role", "city"],
+            "schema": {
+                "name": {"type": "string", "required": true, "minLength": 2},
+                "email": {"type": "string", "required": true},
+                "role": {"type": "string", "default": "member", "enum": ["admin", "engineer", "designer", "member"]},
+                "age": {"type": "int", "min": 13, "max": 120},
+                "city": {"type": "string", "default": "Lahore"}
+            }
+        })
+        self.insertMany(db, "users", [
+            {"id": 1, "name": "Ada Lovelace", "email": "ada@quantum.dev", "role": "admin", "age": 28, "city": "London"},
+            {"id": 2, "name": "Bilal Raza", "email": "bilal@quantum.dev", "role": "engineer", "age": 24, "city": "Lahore"},
+            {"id": 3, "name": "Grace Hopper", "email": "grace@quantum.dev", "role": "admin", "age": 35, "city": "New York"},
+            {"id": 4, "name": "Alan Turing", "email": "alan@quantum.dev", "role": "engineer", "age": 31, "city": "London"},
+            {"id": 5, "name": "Sara Khan", "email": "sara@quantum.dev", "role": "designer", "age": 26, "city": "Lahore"}
+        ])
+
+        self.createCollection(db, "orders", {
+            "primaryKey": "id",
+            "indexes": ["userId", "status"],
+            "schema": {
+                "userId": {"type": "int", "required": true},
+                "item": {"type": "string", "required": true},
+                "amount": {"type": "number", "min": 0},
+                "status": {"type": "string", "default": "paid"}
+            }
+        })
+        self.insertMany(db, "orders", [
+            {"id": 101, "userId": 1, "item": "Quantum Pro License", "amount": 199.0, "status": "paid"},
+            {"id": 102, "userId": 2, "item": "Cloud VM Cluster", "amount": 350.0, "status": "paid"},
+            {"id": 103, "userId": 1, "item": "Edge Compiler Addon", "amount": 89.0, "status": "paid"},
+            {"id": 104, "userId": 4, "item": "Quantum Pro License", "amount": 199.0, "status": "pending"},
+            {"id": 105, "userId": 2, "item": "Static Site Hosting", "amount": 49.0, "status": "paid"}
+        ])
+        return db
+    }
+}
+
+Db = __QDbEngine()
