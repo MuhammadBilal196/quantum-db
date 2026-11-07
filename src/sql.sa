@@ -1,0 +1,598 @@
+# quantum-db / sql — SQL parser and executor for SELECT, INSERT, UPDATE, DELETE, CREATE and DROP
+#
+#   DbSql.execute(db, "SELECT name, age FROM users WHERE age >= 21 AND role = 'admin' ORDER BY age DESC LIMIT 5")
+#   DbSql.execute(db, "SELECT role, COUNT(*) AS count, AVG(age) AS avgAge FROM users GROUP BY role")
+#   DbSql.execute(db, "INSERT INTO users (name, age, role) VALUES ('Grace', 34, 'admin')")
+#
+# Exposes the global: DbSql
+
+class __QDbSql {
+    fn init() {}
+
+    # Tokenizes a SQL statement into tokens:
+    # [{"kind": "word"|"string"|"number"|"symbol", "value": "...", "upper": "..."}]
+    fn tokenize(sqlText) {
+        let s = DbUtil.text(sqlText).trim()
+        if s.endsWith(";") { s = s.slice(0, len(s) - 1).trim() }
+        let tokens = []
+        let i = 0
+        let n = len(s)
+
+        while i < n {
+            while i < n and DbUtil.isSpace(s[i]) { i += 1 }
+            if i >= n { break }
+
+            let ch = s[i]
+            if ch == "'" or ch == "\"" {
+                let quote = ch
+                i += 1
+                let start = i
+                let buf = []
+                while i < n {
+                    if s[i] == quote {
+                        if i + 1 < n and s[i + 1] == quote {
+                            buf.push(quote)
+                            i += 2
+                            continue
+                        }
+                        break
+                    }
+                    buf.push(s[i])
+                    i += 1
+                }
+                if i < n and s[i] == quote { i += 1 }
+                let strVal = buf.join("")
+                tokens.push({"kind": "string", "value": strVal, "upper": strVal.upper()})
+                continue
+            }
+
+            # Two-character comparison operators
+            if i + 1 < n {
+                let two = s.slice(i, i + 2)
+                if two == ">=" or two == "<=" or two == "!=" or two == "<>" {
+                    tokens.push({"kind": "symbol", "value": two, "upper": two})
+                    i += 2
+                    continue
+                }
+            }
+
+            if ch == "(" or ch == ")" or ch == "," or ch == "=" or ch == ">" or ch == "<" or ch == "*" {
+                tokens.push({"kind": "symbol", "value": ch, "upper": ch})
+                i += 1
+                continue
+            }
+
+            # Number or identifier (including dotted table.column)
+            let start = i
+            while i < n and not DbUtil.isSpace(s[i]) and s[i] != "(" and s[i] != ")" and s[i] != "," and s[i] != "=" and s[i] != ">" and s[i] != "<" and s[i] != "'" and s[i] != "\"" {
+                if i + 1 < n and s.slice(i, i + 2) == "!=" { break }
+                i += 1
+            }
+            let raw = s.slice(start, i)
+            if DbUtil.isNumericString(raw) {
+                tokens.push({"kind": "number", "value": num(raw), "upper": raw})
+            } else {
+                tokens.push({"kind": "word", "value": raw, "upper": raw.upper()})
+            }
+        }
+        return tokens
+    }
+
+    fn stripTablePrefix(colName) {
+        let s = DbUtil.text(colName)
+        let dot = s.indexOf(".")
+        if dot > 0 { return s.slice(dot + 1) }
+        return s
+    }
+
+    fn literalFromToken(tok) {
+        if tok["kind"] == "string" { return tok["value"] }
+        if tok["kind"] == "number" { return tok["value"] }
+        let u = tok["upper"]
+        if u == "TRUE" { return true }
+        if u == "FALSE" { return false }
+        if u == "NULL" or u == "NIL" { return null }
+        return tok["value"]
+    }
+
+    # Parses a SQL statement into an AST dict.
+    fn parse(sqlText) {
+        let tokens = self.tokenize(sqlText)
+        if len(tokens) == 0 { raise "empty SQL statement" }
+        let first = tokens[0]["upper"]
+        if first == "SELECT" { return self.parseSelect(tokens) }
+        if first == "INSERT" { return self.parseInsert(tokens) }
+        if first == "UPDATE" { return self.parseUpdate(tokens) }
+        if first == "DELETE" { return self.parseDelete(tokens) }
+        if first == "CREATE" { return self.parseCreate(tokens) }
+        if first == "DROP" { return self.parseDrop(tokens) }
+        raise "unsupported SQL command: " + tokens[0]["value"]
+    }
+
+    # ── CREATE TABLE & DROP TABLE ────────────────────────────────────────
+
+    fn parseCreate(tokens) {
+        let i = 1
+        if i < len(tokens) and tokens[i]["upper"] == "TABLE" { i += 1 }
+        if i + 2 < len(tokens) and tokens[i]["upper"] == "IF" and tokens[i + 1]["upper"] == "NOT" and tokens[i + 2]["upper"] == "EXISTS" {
+            i += 3
+        }
+        if i >= len(tokens) { raise "CREATE TABLE missing table name" }
+        let table = tokens[i]["value"]
+        i += 1
+
+        let schema = {}
+        let primaryKey = "id"
+        let uniqueFields = []
+
+        if i < len(tokens) and tokens[i]["value"] == "(" {
+            i += 1
+            while i < len(tokens) and tokens[i]["value"] != ")" {
+                if tokens[i]["value"] == "," {
+                    i += 1
+                    continue
+                }
+                let colName = tokens[i]["value"]
+                i += 1
+                let colType = "any"
+                if i < len(tokens) and tokens[i]["value"] != "," and tokens[i]["value"] != ")" {
+                    colType = DbSchema.normalizeTypeName(tokens[i]["value"])
+                    i += 1
+                }
+                let rule = {"type": colType, "required": false}
+                while i < len(tokens) and tokens[i]["value"] != "," and tokens[i]["value"] != ")" {
+                    let kw = tokens[i]["upper"]
+                    if kw == "PRIMARY" {
+                        primaryKey = colName
+                        rule["primaryKey"] = true
+                        rule["required"] = true
+                        i += 1
+                        if i < len(tokens) and tokens[i]["upper"] == "KEY" { i += 1 }
+                    } else if kw == "REQUIRED" {
+                        rule["required"] = true
+                        i += 1
+                    } else if kw == "NOT" and i + 1 < len(tokens) and tokens[i + 1]["upper"] == "NULL" {
+                        rule["required"] = true
+                        i += 2
+                    } else if kw == "UNIQUE" {
+                        uniqueFields.push(colName)
+                        i += 1
+                    } else if kw == "DEFAULT" and i + 1 < len(tokens) {
+                        rule["default"] = self.literalFromToken(tokens[i + 1])
+                        i += 2
+                    } else {
+                        i += 1
+                    }
+                }
+                schema[colName] = rule
+            }
+        }
+
+        return {
+            "command": "CREATE_TABLE",
+            "table": table,
+            "schema": schema,
+            "primaryKey": primaryKey,
+            "unique": uniqueFields
+        }
+    }
+
+    fn parseDrop(tokens) {
+        let i = 1
+        if i < len(tokens) and tokens[i]["upper"] == "TABLE" { i += 1 }
+        if i + 1 < len(tokens) and tokens[i]["upper"] == "IF" and tokens[i + 1]["upper"] == "EXISTS" {
+            i += 2
+        }
+        if i >= len(tokens) { raise "DROP TABLE missing table name" }
+        return {"command": "DROP_TABLE", "table": tokens[i]["value"]}
+    }
+
+    # ── INSERT INTO ──────────────────────────────────────────────────────
+
+    fn parseInsert(tokens) {
+        let i = 1
+        if i < len(tokens) and tokens[i]["upper"] == "INTO" { i += 1 }
+        if i >= len(tokens) { raise "INSERT missing table name" }
+        let table = tokens[i]["value"]
+        i += 1
+
+        let columns = []
+        if i < len(tokens) and tokens[i]["value"] == "(" {
+            i += 1
+            while i < len(tokens) and tokens[i]["value"] != ")" {
+                if tokens[i]["value"] != "," { columns.push(tokens[i]["value"]) }
+                i += 1
+            }
+            if i < len(tokens) and tokens[i]["value"] == ")" { i += 1 }
+        }
+
+        if i < len(tokens) and tokens[i]["upper"] == "VALUES" { i += 1 }
+        let rows = []
+        while i < len(tokens) {
+            if tokens[i]["value"] == "," {
+                i += 1
+                continue
+            }
+            if tokens[i]["value"] == "(" {
+                i += 1
+                let vals = []
+                while i < len(tokens) and tokens[i]["value"] != ")" {
+                    if tokens[i]["value"] != "," {
+                        vals.push(self.literalFromToken(tokens[i]))
+                    }
+                    i += 1
+                }
+                if i < len(tokens) and tokens[i]["value"] == ")" { i += 1 }
+                let doc = {}
+                for k in range(len(vals)) {
+                    let col = k < len(columns) ? columns[k] : ("col" + DbUtil.text(k + 1))
+                    doc[col] = vals[k]
+                }
+                rows.push(doc)
+            } else {
+                break
+            }
+        }
+        return {"command": "INSERT", "table": table, "rows": rows}
+    }
+
+    # ── WHERE clause parser ──────────────────────────────────────────────
+
+    fn parseWhereTokens(tokens, startIdx, stopKeywords) {
+        let i = startIdx
+        let n = len(tokens)
+        let orGroups = []
+        let currentAnd = []
+
+        while i < n {
+            let u = tokens[i]["upper"]
+            if stopKeywords.contains(u) { break }
+            if u == "AND" {
+                i += 1
+                continue
+            }
+            if u == "OR" {
+                if len(currentAnd) > 0 {
+                    orGroups.push(self.combineAnd(currentAnd))
+                    currentAnd = []
+                }
+                i += 1
+                continue
+            }
+
+            let field = self.stripTablePrefix(tokens[i]["value"])
+            i += 1
+            if i >= n { break }
+
+            let opTok = tokens[i]["upper"]
+            # IS NULL / IS NOT NULL
+            if opTok == "IS" {
+                i += 1
+                let notNull = false
+                if i < n and tokens[i]["upper"] == "NOT" {
+                    notNull = true
+                    i += 1
+                }
+                if i < n and tokens[i]["upper"] == "NULL" { i += 1 }
+                let cond = {}
+                cond[field] = {"$exists": notNull}
+                currentAnd.push(cond)
+                continue
+            }
+
+            # IN (v1, v2, ...)
+            if opTok == "IN" {
+                i += 1
+                let listVals = []
+                if i < n and tokens[i]["value"] == "(" {
+                    i += 1
+                    while i < n and tokens[i]["value"] != ")" {
+                        if tokens[i]["value"] != "," {
+                            listVals.push(self.literalFromToken(tokens[i]))
+                        }
+                        i += 1
+                    }
+                    if i < n and tokens[i]["value"] == ")" { i += 1 }
+                }
+                let cond = {}
+                cond[field] = {"$in": listVals}
+                currentAnd.push(cond)
+                continue
+            }
+
+            # Standard binary comparison (=, !=, <>, >, >=, <, <=, LIKE, ILIKE)
+            i += 1
+            if i >= n { break }
+            let rhs = self.literalFromToken(tokens[i])
+            i += 1
+
+            let cond = {}
+            if opTok == "=" {
+                cond[field] = rhs
+            } else if opTok == "!=" or opTok == "<>" {
+                cond[field] = {"$ne": rhs}
+            } else if opTok == ">" {
+                cond[field] = {"$gt": rhs}
+            } else if opTok == ">=" {
+                cond[field] = {"$gte": rhs}
+            } else if opTok == "<" {
+                cond[field] = {"$lt": rhs}
+            } else if opTok == "<=" {
+                cond[field] = {"$lte": rhs}
+            } else if opTok == "LIKE" {
+                cond[field] = {"$like": DbUtil.text(rhs)}
+            } else if opTok == "ILIKE" {
+                cond[field] = {"$ilike": DbUtil.text(rhs)}
+            } else {
+                cond[field] = rhs
+            }
+            currentAnd.push(cond)
+        }
+
+        if len(currentAnd) > 0 {
+            orGroups.push(self.combineAnd(currentAnd))
+        }
+        let whereSpec = {}
+        if len(orGroups) == 1 {
+            whereSpec = orGroups[0]
+        } else if len(orGroups) > 1 {
+            whereSpec = {"$or": orGroups}
+        }
+        return {"where": whereSpec, "nextIndex": i}
+    }
+
+    fn combineAnd(condList) {
+        if len(condList) == 0 { return {} }
+        if len(condList) == 1 { return condList[0] }
+        return {"$and": condList}
+    }
+
+    # ── SELECT ───────────────────────────────────────────────────────────
+
+    fn parseSelect(tokens) {
+        let i = 1
+        let n = len(tokens)
+        let selectCols = []
+        let aggMetrics = {}
+        let hasAgg = false
+
+        while i < n and tokens[i]["upper"] != "FROM" {
+            if tokens[i]["value"] == "," {
+                i += 1
+                continue
+            }
+            let tok = tokens[i]
+            let fnUpper = tok["upper"]
+            if (fnUpper == "COUNT" or fnUpper == "SUM" or fnUpper == "AVG" or fnUpper == "MIN" or fnUpper == "MAX") and i + 1 < n and tokens[i + 1]["value"] == "(" {
+                hasAgg = true
+                i += 2
+                let argField = "*"
+                if i < n and tokens[i]["value"] != ")" {
+                    argField = self.stripTablePrefix(tokens[i]["value"])
+                    i += 1
+                }
+                if i < n and tokens[i]["value"] == ")" { i += 1 }
+                let alias = fnUpper.lower() + (argField == "*" ? "" : ("_" + argField))
+                if i < n and tokens[i]["upper"] == "AS" and i + 1 < n {
+                    alias = tokens[i + 1]["value"]
+                    i += 2
+                }
+                let mSpec = {}
+                mSpec["$" + fnUpper.lower()] = argField
+                aggMetrics[alias] = mSpec
+                continue
+            }
+
+            let colName = self.stripTablePrefix(tok["value"])
+            i += 1
+            let alias = colName
+            if i < n and tokens[i]["upper"] == "AS" and i + 1 < n {
+                alias = tokens[i + 1]["value"]
+                i += 2
+            }
+            if alias != colName {
+                selectCols.push({"field": colName, "as": alias})
+            } else {
+                selectCols.push(colName)
+            }
+        }
+
+        if i < n and tokens[i]["upper"] == "FROM" { i += 1 }
+        if i >= n { raise "SELECT missing table name after FROM" }
+        let table = tokens[i]["value"]
+        i += 1
+
+        # Optional JOIN: [INNER | LEFT] JOIN <table> ON <a.x> = <b.y>
+        let joinSpec = null
+        if i < n and (tokens[i]["upper"] == "JOIN" or tokens[i]["upper"] == "INNER" or tokens[i]["upper"] == "LEFT") {
+            let joinType = "inner"
+            if tokens[i]["upper"] == "LEFT" {
+                joinType = "left"
+                i += 1
+            } else if tokens[i]["upper"] == "INNER" {
+                i += 1
+            }
+            if i < n and tokens[i]["upper"] == "JOIN" { i += 1 }
+            let rightTable = tokens[i]["value"]
+            i += 1
+            if i < n and tokens[i]["upper"] == "ON" { i += 1 }
+            let leftCol = self.stripTablePrefix(tokens[i]["value"])
+            i += 1
+            if i < n and tokens[i]["value"] == "=" { i += 1 }
+            let rightCol = self.stripTablePrefix(tokens[i]["value"])
+            i += 1
+            joinSpec = {
+                "table": rightTable,
+                "localField": leftCol,
+                "foreignField": rightCol,
+                "type": joinType
+            }
+        }
+
+        let stopWords = ["GROUP", "ORDER", "LIMIT", "OFFSET"]
+        let whereSpec = null
+        if i < n and tokens[i]["upper"] == "WHERE" {
+            let parsedWhere = self.parseWhereTokens(tokens, i + 1, stopWords)
+            whereSpec = parsedWhere["where"]
+            i = parsedWhere["nextIndex"]
+        }
+
+        let groupBy = []
+        if i + 1 < n and tokens[i]["upper"] == "GROUP" and tokens[i + 1]["upper"] == "BY" {
+            i += 2
+            while i < n and tokens[i]["upper"] != "ORDER" and tokens[i]["upper"] != "LIMIT" and tokens[i]["upper"] != "OFFSET" {
+                if tokens[i]["value"] != "," {
+                    groupBy.push(self.stripTablePrefix(tokens[i]["value"]))
+                }
+                i += 1
+            }
+        }
+
+        let orderBy = []
+        if i + 1 < n and tokens[i]["upper"] == "ORDER" and tokens[i + 1]["upper"] == "BY" {
+            i += 2
+            while i < n and tokens[i]["upper"] != "LIMIT" and tokens[i]["upper"] != "OFFSET" {
+                if tokens[i]["value"] == "," {
+                    i += 1
+                    continue
+                }
+                let f = self.stripTablePrefix(tokens[i]["value"])
+                i += 1
+                let desc = false
+                if i < n and (tokens[i]["upper"] == "ASC" or tokens[i]["upper"] == "DESC") {
+                    desc = tokens[i]["upper"] == "DESC"
+                    i += 1
+                }
+                orderBy.push({"field": f, "desc": desc})
+            }
+        }
+
+        let limit = 0
+        let offset = 0
+        while i < n {
+            if tokens[i]["upper"] == "LIMIT" and i + 1 < n {
+                limit = tokens[i + 1]["value"]
+                i += 2
+            } else if tokens[i]["upper"] == "OFFSET" and i + 1 < n {
+                offset = tokens[i + 1]["value"]
+                i += 2
+            } else {
+                i += 1
+            }
+        }
+
+        return {
+            "command": "SELECT",
+            "table": table,
+            "select": selectCols,
+            "hasAgg": hasAgg or len(groupBy) > 0,
+            "groupBy": groupBy,
+            "metrics": aggMetrics,
+            "join": joinSpec,
+            "where": whereSpec,
+            "orderBy": orderBy,
+            "limit": limit,
+            "offset": offset
+        }
+    }
+
+    # ── UPDATE & DELETE ──────────────────────────────────────────────────
+
+    fn parseUpdate(tokens) {
+        let i = 1
+        if i >= len(tokens) { raise "UPDATE missing table name" }
+        let table = tokens[i]["value"]
+        i += 1
+        if i < len(tokens) and tokens[i]["upper"] == "SET" { i += 1 }
+
+        let changes = {}
+        while i < len(tokens) and tokens[i]["upper"] != "WHERE" {
+            if tokens[i]["value"] == "," {
+                i += 1
+                continue
+            }
+            let col = tokens[i]["value"]
+            i += 1
+            if i < len(tokens) and tokens[i]["value"] == "=" { i += 1 }
+            if i < len(tokens) {
+                changes[col] = self.literalFromToken(tokens[i])
+                i += 1
+            }
+        }
+
+        let whereSpec = null
+        if i < len(tokens) and tokens[i]["upper"] == "WHERE" {
+            let parsedWhere = self.parseWhereTokens(tokens, i + 1, [])
+            whereSpec = parsedWhere["where"]
+        }
+        return {"command": "UPDATE", "table": table, "changes": changes, "where": whereSpec}
+    }
+
+    fn parseDelete(tokens) {
+        let i = 1
+        if i < len(tokens) and tokens[i]["upper"] == "FROM" { i += 1 }
+        if i >= len(tokens) { raise "DELETE missing table name" }
+        let table = tokens[i]["value"]
+        i += 1
+        let whereSpec = null
+        if i < len(tokens) and tokens[i]["upper"] == "WHERE" {
+            let parsedWhere = self.parseWhereTokens(tokens, i + 1, [])
+            whereSpec = parsedWhere["where"]
+        }
+        return {"command": "DELETE", "table": table, "where": whereSpec}
+    }
+
+    # ── Executor ─────────────────────────────────────────────────────────
+
+    fn execute(db, sqlText) {
+        let ast = self.parse(sqlText)
+        let cmd = ast["command"]
+        let table = ast["table"]
+
+        if cmd == "CREATE_TABLE" {
+            Db.createCollection(db, table, {
+                "schema": ast["schema"],
+                "primaryKey": ast["primaryKey"],
+                "unique": ast["unique"]
+            })
+            return {"command": cmd, "table": table, "ok": true}
+        }
+        if cmd == "DROP_TABLE" {
+            let dropped = Db.dropCollection(db, table)
+            return {"command": cmd, "table": table, "dropped": dropped}
+        }
+        if cmd == "INSERT" {
+            let inserted = Db.insertMany(db, table, ast["rows"])
+            return {"command": cmd, "table": table, "insertedCount": len(inserted), "rows": inserted}
+        }
+        if cmd == "UPDATE" {
+            let updated = Db.update(db, table, ast["where"], ast["changes"])
+            return {"command": cmd, "table": table, "updatedCount": updated}
+        }
+        if cmd == "DELETE" {
+            let deleted = Db.remove(db, table, ast["where"])
+            return {"command": cmd, "table": table, "deletedCount": deleted}
+        }
+        if cmd == "SELECT" {
+            let querySpec = {
+                "where": ast["where"],
+                "orderBy": ast["orderBy"],
+                "limit": ast["limit"],
+                "offset": ast["offset"]
+            }
+            if ast["join"] != null {
+                querySpec["join"] = ast["join"]
+            }
+            if ast["hasAgg"] {
+                querySpec["groupBy"] = ast["groupBy"]
+                querySpec["metrics"] = ast["metrics"]
+            } else if len(ast["select"]) > 0 {
+                querySpec["select"] = ast["select"]
+            }
+            return Db.find(db, table, querySpec)
+        }
+        raise "unknown SQL command: " + cmd
+    }
+}
+
+DbSql = __QDbSql()
