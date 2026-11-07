@@ -1,0 +1,24 @@
+# quantum-db — embedded document & relational database engine, SQL/NoSQL query executor and CLI for Quantum
+#
+# Stores collections in memory or in a single JSON database file with schemas, unique and
+# secondary hash indexes, Mongo-style query operators, SQL statements (CREATE, INSERT, SELECT,
+# JOIN, GROUP BY, UPDATE, DELETE), ACID-style snapshot transactions, and table/Markdown/CSV export.
+#
+#   Global      Module            What it does
+#   ──────────  ────────────────  ──────────────────────────────────────────────────────────
+#   DbUtil      src/util.sa       deep clone/equal, dotted paths, multi-key sort, file helpers
+#   DbSchema    src/schema.sa     field types, defaults, constraints and document validation
+#   DbQuery     src/query.sa      filter operators ($gt, $in, $like, $or...), joins, groupBy
+#   DbSql       src/sql.sa        SQL parser & executor (SELECT, INSERT, UPDATE, DELETE, JOIN)
+#   DbFormat    src/format.sa     Unicode/ASCII tables, Markdown tables, CSV and JSONL
+#   Db          src/engine.sa     database CRUD, indexing, transactions, persistence & demo
+#
+# Bundle entry: lists the modules in dependency order. Use it with `# @use quantum-db`
+# and quantum-bundle, or run the pre-bundled single files in dist/.
+
+# @use ./src/util.sa
+# @use ./src/schema.sa
+# @use ./src/query.sa
+# @use ./src/sql.sa
+# @use ./src/format.sa
+# @use ./src/engine.sa
