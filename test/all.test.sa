@@ -1,0 +1,246 @@
+# quantum-db — full test suite
+#
+#   qrun test/run-tests.sa
+
+# @use ../index.sa
+# @use ./harness.sa
+
+# ── 1. DbUtil ────────────────────────────────────────────────────────────
+
+Check.section("DbUtil")
+Check.eq("text from null", DbUtil.text(null), "")
+Check.eq("text from bool", DbUtil.text(true), "true")
+Check.eq("text from int", DbUtil.text(105), "105")
+Check.eq("safeKey protects 'get'", DbUtil.safeKey("get"), "_get")
+Check.eq("unsafeKey restores 'get'", DbUtil.unsafeKey("_get"), "get")
+Check.eq("safeKey leaves normal string", DbUtil.safeKey("users"), "users")
+
+Check.ok("isNumericString integer", DbUtil.isNumericString("-42"))
+Check.ok("isNumericString float", DbUtil.isNumericString("19.95"))
+Check.ok("isNumericString rejects two dots", not DbUtil.isNumericString("1.2.3"))
+Check.eq("autoValue int", DbUtil.autoValue("42"), 42)
+Check.eq("autoValue bool", DbUtil.autoValue("true"), true)
+Check.eq("autoValue null", DbUtil.autoValue("NULL"), null)
+Check.eq("autoValue string", DbUtil.autoValue("hello"), "hello")
+
+let nested = {"user": {"profile": {"city": "Lahore", "zip": 54000}}}
+let copyNested = DbUtil.clone(nested)
+DbUtil.setPath(copyNested, "user.profile.city", "Karachi")
+Check.eq("deep clone does not mutate original", DbUtil.getPath(nested, "user.profile.city"), "Lahore")
+Check.eq("setPath updates nested value", DbUtil.getPath(copyNested, "user.profile.city"), "Karachi")
+Check.ok("hasPath true for existing", DbUtil.hasPath(nested, "user.profile.zip"))
+Check.ok("hasPath false for missing", not DbUtil.hasPath(nested, "user.profile.country"))
+
+let toSort = [
+    {"name": "Charlie", "dept": "eng", "score": 80},
+    {"name": "Alice", "dept": "eng", "score": 95},
+    {"name": "Bob", "dept": "design", "score": 95}
+]
+let sortedMulti = DbUtil.sortRecords(toSort, ["score:desc", "name:asc"])
+Check.eq("multi-key sort 1st", sortedMulti[0]["name"], "Alice")
+Check.eq("multi-key sort 2nd", sortedMulti[1]["name"], "Bob")
+Check.eq("multi-key sort 3rd", sortedMulti[2]["name"], "Charlie")
+
+# ── 2. DbSchema ──────────────────────────────────────────────────────────
+
+Check.section("DbSchema")
+let userSchema = DbSchema.normalize({
+    "name": "string!",
+    "age": {"type": "int", "min": 13, "max": 120},
+    "role": {"type": "string", "default": "member", "enum": ["admin", "member", "guest"]},
+    "tags": {"type": "array", "maxLength": 3}
+})
+
+let prepared = DbSchema.prepare(userSchema, {"name": "Bilal", "age": 24})
+Check.eq("prepare fills default role", prepared["role"], "member")
+Check.ok("validate passes valid doc", DbSchema.validate(userSchema, prepared)["valid"])
+
+let missingReq = DbSchema.validate(userSchema, {"age": 25})
+Check.ok("validate catches missing required field", not missingReq["valid"])
+
+let badType = DbSchema.validate(userSchema, {"name": "Ada", "age": 22.5})
+Check.ok("validate catches non-int float for int field", not badType["valid"])
+
+let badMin = DbSchema.validate(userSchema, {"name": "Kid", "age": 8})
+Check.ok("validate catches min constraint", not badMin["valid"])
+
+let badEnum = DbSchema.validate(userSchema, {"name": "Ada", "age": 28, "role": "superadmin"})
+Check.ok("validate catches enum constraint", not badEnum["valid"])
+
+# ── 3. DbQuery (Filters, Updates, Joins, Aggregations) ───────────────────
+
+Check.section("DbQuery")
+let sampleDoc = {
+    "id": 1,
+    "name": "Ada Lovelace",
+    "age": 28,
+    "role": "admin",
+    "skills": ["quantum", "math", "vm"],
+    "address": {"city": "London", "country": "UK"}
+}
+
+Check.ok("matches direct equality", DbQuery.matches(sampleDoc, {"role": "admin"}))
+Check.ok("matches nested dotted path", DbQuery.matches(sampleDoc, {"address.city": "London"}))
+Check.ok("matches $gt and $lte", DbQuery.matches(sampleDoc, {"age": {"$gt": 20, "$lte": 28}}))
+Check.ok("matches $between", DbQuery.matches(sampleDoc, {"age": {"$between": [25, 30]}}))
+Check.ok("matches $in", DbQuery.matches(sampleDoc, {"role": {"$in": ["admin", "lead"]}}))
+Check.ok("matches $nin", DbQuery.matches(sampleDoc, {"role": {"$nin": ["guest", "banned"]}}))
+Check.ok("matches array $contains", DbQuery.matches(sampleDoc, {"skills": {"$contains": "quantum"}}))
+Check.ok("matches array $all", DbQuery.matches(sampleDoc, {"skills": {"$all": ["quantum", "vm"]}}))
+Check.ok("matches array $size", DbQuery.matches(sampleDoc, {"skills": {"$size": 3}}))
+Check.ok("matches string $startsWith", DbQuery.matches(sampleDoc, {"name": {"$startsWith": "Ada"}}))
+Check.ok("matches string $like", DbQuery.matches(sampleDoc, {"name": {"$like": "Ada %lace"}}))
+Check.ok("matches string $ilike", DbQuery.matches(sampleDoc, {"name": {"$ilike": "ada %LACE"}}))
+Check.ok("matches $or", DbQuery.matches(sampleDoc, {"$or": [{"age": 99}, {"role": "admin"}]}))
+Check.ok("matches $not", DbQuery.matches(sampleDoc, {"$not": {"role": "guest"}}))
+
+let mutated = DbQuery.applyChanges(sampleDoc, {
+    "$set": {"role": "lead", "address.city": "Oxford"},
+    "$inc": {"age": 2},
+    "$push": {"skills": "sql"},
+    "$pull": {"skills": "math"}
+})
+Check.eq("$set updates top & nested field", [mutated["role"], DbUtil.getPath(mutated, "address.city")], ["lead", "Oxford"])
+Check.eq("$inc increments age", mutated["age"], 30)
+Check.eq("$push and $pull update array", mutated["skills"], ["quantum", "vm", "sql"])
+
+let projected = DbQuery.projectRecord(sampleDoc, ["name", {"field": "address.city", "as": "city"}])
+Check.eq("projectRecord keeps & aliases fields", projected, {"name": "Ada Lovelace", "city": "London"})
+
+# ── 4. DbFormat (ASCII Table, Markdown, CSV, JSONL) ──────────────────────
+
+Check.section("DbFormat")
+let fmtRows = [
+    {"id": 1, "name": "Ada, Countess", "score": 98.5, "active": true},
+    {"id": 2, "name": "Bilal \"Dev\"", "score": 92.0, "active": false}
+]
+let asciiTbl = DbFormat.table(fmtRows, ["id", "name", "score"])
+Check.has("ASCII table has border", asciiTbl, "+----+")
+Check.has("ASCII table has header", asciiTbl, "| id |")
+
+let mdTbl = DbFormat.markdown(fmtRows, ["id", "name", "score"])
+Check.has("Markdown table has header", mdTbl, "| id | name | score |")
+Check.has("Markdown table has separator", mdTbl, "| --- | --- | --- |")
+
+let csvOut = DbFormat.csv(fmtRows, ["id", "name", "score", "active"])
+let csvBack = DbFormat.parseCsv(csvOut, {"autoTypes": true})
+Check.eq("CSV round-trip count", len(csvBack), 2)
+Check.eq("CSV round-trip preserves comma in string", csvBack[0]["name"], "Ada, Countess")
+Check.eq("CSV round-trip preserves quotes in string", csvBack[1]["name"], "Bilal \"Dev\"")
+Check.eq("CSV round-trip auto-converts number & bool", [csvBack[0]["score"], csvBack[0]["active"]], [98.5, true])
+
+let jsonlOut = DbFormat.jsonl(fmtRows)
+let jsonlBack = DbFormat.parseJsonl(jsonlOut)
+Check.eq("JSONL round-trip", jsonlBack, fmtRows)
+
+# ── 5. Db Engine (CRUD, Indexes, Joins, Aggregations, Transactions) ──────
+
+Check.section("Db Engine")
+let db = Db.sampleDatabase()
+Check.eq("sampleDatabase has 5 users", Db.count(db, "users", null), 5)
+Check.eq("sampleDatabase has 5 orders", Db.count(db, "orders", null), 5)
+
+let insertedUser = Db.insert(db, "users", {"name": "Zayd Ali", "email": "zayd@quantum.dev"})
+Check.eq("auto-increment assigns id 6", insertedUser["id"], 6)
+Check.eq("schema default sets role='member'", insertedUser["role"], "member")
+Check.eq("schema default sets city='Lahore'", insertedUser["city"], "Lahore")
+
+Check.throws("unique index rejects duplicate email", fn() {
+    Db.insert(db, "users", {"name": "Clone", "email": "ada@quantum.dev", "age": 30})
+})
+
+Check.throws("primary key rejects duplicate id", fn() {
+    Db.insert(db, "users", {"id": 1, "name": "Clone", "email": "clone@quantum.dev", "age": 30})
+})
+
+# Indexed equality lookup
+let lahoreUsers = Db.find(db, "users", {"where": {"city": "Lahore"}, "orderBy": "id:asc"})
+Check.eq("indexed lookup finds 3 Lahore users", len(lahoreUsers), 3)
+Check.eq("indexed lookup first is Bilal", lahoreUsers[0]["name"], "Bilal Raza")
+
+# Update & Upsert
+let updCount = Db.update(db, "users", {"email": "zayd@quantum.dev"}, {"$set": {"age": 27, "role": "engineer"}})
+Check.eq("update returns 1 modified row", updCount, 1)
+Check.eq("updated age persisted", Db.get(db, "users", 6)["age"], 27)
+
+let upsertedNew = Db.upsert(db, "users", {"email": "noor@quantum.dev"}, {"name": "Noor", "email": "noor@quantum.dev", "age": 23})
+Check.eq("upsert inserts when missing", upsertedNew["id"], 7)
+let upsertedExisting = Db.upsert(db, "users", {"email": "noor@quantum.dev"}, {"$set": {"age": 24}})
+Check.eq("upsert updates when present", upsertedExisting["age"], 24)
+
+# Lookup Join & GroupBy via Db.find
+let userWithOrders = Db.find(db, "users", {
+    "where": {"id": 1},
+    "join": {"table": "orders", "localField": "id", "foreignField": "userId", "type": "lookup", "as": "orders"}
+})
+Check.eq("lookup join attaches 2 orders to Ada", len(userWithOrders[0]["orders"]), 2)
+
+let spendByUser = Db.find(db, "orders", {
+    "where": {"status": "paid"},
+    "groupBy": "userId",
+    "metrics": {"orderCount": {"$count": "*"}, "totalSpent": {"$sum": "amount"}},
+    "orderBy": "totalSpent:desc"
+})
+Check.eq("aggregation top spender is userId 2", spendByUser[0]["userId"], 2)
+Check.eq("aggregation top spender sum is 399", spendByUser[0]["totalSpent"], 399.0)
+
+# Transactions (commit & rollback)
+Db.begin(db)
+Db.remove(db, "users", {"city": "Lahore"})
+Check.eq("inside tx Lahore users removed", Db.count(db, "users", {"city": "Lahore"}), 0)
+Db.rollback(db)
+Check.eq("after rollback Lahore users restored", Db.count(db, "users", {"city": "Lahore"}), 4)
+
+Check.throws("failed Db.transaction rolls back automatically", fn() {
+    Db.transaction(db, fn() {
+        Db.removeById(db, "users", 1)
+        raise "abort transaction"
+    })
+})
+Check.ok("user 1 still exists after failed transaction", Db.has(db, "users", 1))
+
+# ── 6. DbSql (CREATE, INSERT, SELECT, JOIN, GROUP BY, UPDATE, DELETE, DROP) ──
+
+Check.section("DbSql")
+Db.sql(db, "CREATE TABLE tasks (id INT PRIMARY KEY, title STRING REQUIRED, points INT DEFAULT 10, done BOOL DEFAULT false)")
+Check.ok("CREATE TABLE creates collection", Db.hasCollection(db, "tasks"))
+
+let insRes = Db.sql(db, "INSERT INTO tasks (title, points, done) VALUES ('Write parser', 25, true), ('Write tests', 15, false), ('Publish package', 50, false)")
+Check.eq("SQL INSERT adds 3 rows", insRes["insertedCount"], 3)
+
+let selRows = Db.sql(db, "SELECT id, title, points FROM tasks WHERE points >= 20 AND done = false ORDER BY points DESC")
+Check.eq("SQL SELECT WHERE filters to 1 row", len(selRows), 1)
+Check.eq("SQL SELECT row title", selRows[0]["title"], "Publish package")
+
+let likeRows = Db.sql(db, "SELECT title FROM tasks WHERE title LIKE 'Write %' ORDER BY id ASC")
+Check.eq("SQL LIKE matches 2 rows", len(likeRows), 2)
+
+let inRows = Db.sql(db, "SELECT name FROM users WHERE role IN ('admin', 'designer') ORDER BY name ASC")
+Check.eq("SQL IN matches 3 users", len(inRows), 3)
+
+let aggSql = Db.sql(db, "SELECT done, COUNT(*) AS count, SUM(points) AS total_points FROM tasks GROUP BY done ORDER BY total_points DESC")
+Check.eq("SQL GROUP BY returns 2 groups", len(aggSql), 2)
+Check.eq("SQL GROUP BY top total_points is 65", aggSql[0]["total_points"], 65)
+
+let joinSql = Db.sql(db, "SELECT name, item, amount FROM users INNER JOIN orders ON users.id = orders.userId WHERE amount >= 150 ORDER BY amount DESC")
+Check.eq("SQL INNER JOIN with WHERE returns 3 rows", len(joinSql), 3)
+Check.eq("SQL INNER JOIN top row is Bilal Raza ($350)", [joinSql[0]["name"], joinSql[0]["amount"]], ["Bilal Raza", 350.0])
+
+let updSql = Db.sql(db, "UPDATE tasks SET done = true, points = 30 WHERE title = 'Write tests'")
+Check.eq("SQL UPDATE modifies 1 row", updSql["updatedCount"], 1)
+Check.eq("SQL UPDATE persisted values", [Db.get(db, "tasks", 2)["done"], Db.get(db, "tasks", 2)["points"]], [true, 30])
+
+let delSql = Db.sql(db, "DELETE FROM tasks WHERE done = true")
+Check.eq("SQL DELETE removes 2 done tasks", delSql["deletedCount"], 2)
+Check.eq("1 task remains after DELETE", Db.count(db, "tasks", null), 1)
+
+let dropSql = Db.sql(db, "DROP TABLE tasks")
+Check.ok("SQL DROP TABLE removes collection", dropSql["dropped"] and not Db.hasCollection(db, "tasks"))
+
+# JSON Serialization round-trip
+let serialized = Db.toJSON(db)
+let reloaded = Db.fromJSON(serialized)
+Check.eq("JSON round-trip preserves user count", Db.count(reloaded, "users", null), 7)
+Check.eq("JSON round-trip preserves SQL query ability", len(Db.sql(reloaded, "SELECT id FROM users WHERE role = 'admin'")), 2)
+
+Check.report()
