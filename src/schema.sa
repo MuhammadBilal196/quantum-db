@@ -1,0 +1,147 @@
+# quantum-db / schema — collection schema definitions, default values and constraint validation
+#
+#   let schema = DbSchema.normalize({
+#       "name": {"type": "string", "required": true, "minLength": 2},
+#       "age":  {"type": "int", "min": 0, "max": 150},
+#       "role": {"type": "string", "default": "member", "enum": ["admin", "member", "guest"]}
+#   })
+#   let doc = DbSchema.prepare(schema, {"name": "Ada", "age": 28})
+#   let check = DbSchema.validate(schema, doc)   # {"valid": true, "errors": []}
+#
+# Exposes the global: DbSchema
+
+class __QDbSchema {
+    fn init() {}
+
+    fn normalizeTypeName(t) {
+        let s = DbUtil.text(t).lower().trim()
+        if s == "str" or s == "text" or s == "varchar" { return "string" }
+        if s == "integer" or s == "int" { return "int" }
+        if s == "float" or s == "double" or s == "num" or s == "real" { return "number" }
+        if s == "bool" { return "boolean" }
+        if s == "list" { return "array" }
+        if s == "object" or s == "map" or s == "json" { return "dict" }
+        if s == "" { return "any" }
+        return s
+    }
+
+    # Normalizes a schema dict where values can be shorthand strings ("string", "int!")
+    # or rule dicts ({"type": "string", "required": true, "default": ...}).
+    fn normalize(schema) {
+        if schema == null or type(schema) != "dict" { return {} }
+        let out = {}
+        for field in schema.keys() {
+            let spec = schema[field]
+            if type(spec) == "string" {
+                let raw = spec.trim()
+                let req = raw.endsWith("!")
+                if req { raw = raw.slice(0, len(raw) - 1).trim() }
+                out[field] = {
+                    "type": self.normalizeTypeName(raw),
+                    "required": req
+                }
+            } else if type(spec) == "dict" {
+                let rule = DbUtil.clone(spec)
+                rule["type"] = self.normalizeTypeName(rule.get("type", "any"))
+                rule["required"] = rule.get("required", false) == true or rule.get("primaryKey", false) == true
+                out[field] = rule
+            }
+        }
+        return out
+    }
+
+    # Applies default values from `schema` to a cloned copy of `doc`.
+    fn prepare(schema, doc) {
+        let out = DbUtil.clone(doc)
+        if type(out) != "dict" { raise "document must be a dict" }
+        if schema == null or type(schema) != "dict" { return out }
+        for field in schema.keys() {
+            let rule = schema[field]
+            if type(rule) != "dict" { continue }
+            if (not (field in out) or out[field] == null) and ("default" in rule) {
+                out[field] = DbUtil.clone(rule["default"])
+            }
+        }
+        return out
+    }
+
+    fn matchesType(value, expectedType) {
+        if expectedType == "any" or expectedType == "" { return true }
+        let actual = type(value)
+        if expectedType == "boolean" or expectedType == "bool" {
+            return actual == "bool" or actual == "boolean"
+        }
+        if expectedType == "int" {
+            return actual == "number" and value == floor(value)
+        }
+        return actual == expectedType
+    }
+
+    # Validates `doc` against `schema`. Returns {"valid": bool, "errors": [...]}.
+    fn validate(schema, doc) {
+        let errors = []
+        if type(doc) != "dict" {
+            return {"valid": false, "errors": ["document must be a dict"]}
+        }
+        if schema == null or type(schema) != "dict" or len(schema.keys()) == 0 {
+            return {"valid": true, "errors": errors}
+        }
+
+        let norm = self.normalize(schema)
+        for field in norm.keys() {
+            let rule = norm[field]
+            let present = (field in doc) and doc[field] != null
+            if not present {
+                if rule.get("required", false) == true {
+                    errors.push("field '" + field + "' is required")
+                }
+                continue
+            }
+
+            let val = doc[field]
+            let expectedType = rule.get("type", "any")
+            if not self.matchesType(val, expectedType) {
+                errors.push("field '" + field + "' expected type " + expectedType + ", got " + type(val))
+                continue
+            }
+
+            if "min" in rule and type(val) == "number" and val < rule["min"] {
+                errors.push("field '" + field + "' must be >= " + DbUtil.text(rule["min"]))
+            }
+            if "max" in rule and type(val) == "number" and val > rule["max"] {
+                errors.push("field '" + field + "' must be <= " + DbUtil.text(rule["max"]))
+            }
+            if "minLength" in rule and (type(val) == "string" or type(val) == "array") and len(val) < rule["minLength"] {
+                errors.push("field '" + field + "' length must be >= " + DbUtil.text(rule["minLength"]))
+            }
+            if "maxLength" in rule and (type(val) == "string" or type(val) == "array") and len(val) > rule["maxLength"] {
+                errors.push("field '" + field + "' length must be <= " + DbUtil.text(rule["maxLength"]))
+            }
+            if "enum" in rule and type(rule["enum"]) == "array" {
+                let allowed = rule["enum"]
+                let found = false
+                for item in allowed {
+                    if DbUtil.equals(val, item) {
+                        found = true
+                        break
+                    }
+                }
+                if not found {
+                    errors.push("field '" + field + "' must be one of [" + allowed.join(", ") + "]")
+                }
+            }
+        }
+
+        return {"valid": len(errors) == 0, "errors": errors}
+    }
+
+    fn assertValid(schema, doc) {
+        let res = self.validate(schema, doc)
+        if not res["valid"] {
+            raise "schema validation failed: " + res["errors"].join("; ")
+        }
+        return true
+    }
+}
+
+DbSchema = __QDbSchema()
