@@ -1,0 +1,51 @@
+{
+  "name": "quantum-db",
+  "version": "1.0.0",
+  "description": "Embedded document and relational database engine for Quantum: schemas, unique and secondary hash indexes, Mongo-style query operators, SQL execution (SELECT, INSERT, UPDATE, DELETE, JOIN, GROUP BY), transactions and ASCII/Markdown/CSV export.",
+  "main": "index.sa",
+  "bin": {
+    "quantum-db": "dist/quantum-db-cli.sa"
+  },
+  "keywords": [
+    "quantum",
+    "sa",
+    "qpm",
+    "database",
+    "db",
+    "sql",
+    "nosql",
+    "query",
+    "table",
+    "csv"
+  ],
+  "author": "Muhammad Bilal Raza",
+  "license": "MIT",
+  "files": [
+    "index.sa",
+    "src/",
+    "bin/",
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "qrun dist/quantum-db-cli.sa",
+    "demo": "qrun dist/quantum-db-cli.sa demo",
+    "test": "qrun test/run-tests.sa"
+  },
+  "quantum": {
+    "bundles": [
+      { "entry": "index.sa", "out": "dist/quantum-db.sa" },
+      { "entry": "bin/quantum-db.sa", "out": "dist/quantum-db-cli.sa" },
+      { "entry": "test/all.test.sa", "out": "test/run-tests.sa" }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MuhammadBilal196/quantum-db.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MuhammadBilal196/quantum-db/issues"
+  },
+  "homepage": "https://github.com/MuhammadBilal196/quantum-db#readme"
+}
