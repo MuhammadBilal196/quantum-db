@@ -1,0 +1,269 @@
+# quantum-db / format — ASCII/Unicode tables, Markdown tables, CSV and JSONL import/export
+#
+#   print(DbFormat.table(rows, ["id", "name", "role", "age"]))
+#   print(DbFormat.markdown(rows, ["id", "name", "role"]))
+#   let csvText = DbFormat.csv(rows, null)
+#   let parsed  = DbFormat.parseCsv(csvText, {"autoTypes": true})
+#
+# Exposes the global: DbFormat
+
+class __QDbFormat {
+    fn init() {}
+
+    fn formatCell(value) {
+        if value == null { return "NULL" }
+        if type(value) == "array" or type(value) == "dict" {
+            return JSON.stringify(value)
+        }
+        return DbUtil.text(value)
+    }
+
+    # Infers ordered column headers from `records` when `columns` is null or empty.
+    fn columnsOf(records, columns) {
+        if columns != null and type(columns) == "array" and len(columns) > 0 {
+            return columns
+        }
+        let cols = []
+        let seen = {}
+        if records == null or len(records) == 0 { return cols }
+
+        # Put "id" first when present
+        for r in records {
+            if type(r) == "dict" and ("id" in r) and not ("id" in seen) {
+                seen["id"] = true
+                cols.push("id")
+                break
+            }
+        }
+        for r in records {
+            if type(r) != "dict" { continue }
+            for k in r.keys() {
+                let sk = DbUtil.safeKey(k)
+                if not (sk in seen) {
+                    seen[sk] = true
+                    cols.push(k)
+                }
+            }
+        }
+        return cols
+    }
+
+    fn repeatChar(ch, count) {
+        let out = []
+        for i in range(count) { out.push(ch) }
+        return out.join("")
+    }
+
+    fn padCell(text, width, rightAlign) {
+        let s = DbUtil.text(text)
+        let diff = width - len(s)
+        if diff <= 0 { return s }
+        let spaces = self.repeatChar(" ", diff)
+        return rightAlign ? (spaces + s) : (s + spaces)
+    }
+
+    # Renders `records` as an ASCII box table (`+----+------+`).
+    fn table(records, columns) {
+        if records == null or len(records) == 0 {
+            return "(0 rows)"
+        }
+        let cols = self.columnsOf(records, columns)
+        if len(cols) == 0 { return "(0 columns)" }
+
+        let widths = []
+        let numericCols = []
+        for c in cols {
+            widths.push(len(DbUtil.text(c)))
+            numericCols.push(true)
+        }
+
+        let matrix = []
+        for r in records {
+            let rowCells = []
+            for j in range(len(cols)) {
+                let colName = cols[j]
+                let rawVal = DbUtil.getPath(r, colName)
+                if rawVal != null and type(rawVal) != "number" {
+                    numericCols[j] = false
+                }
+                let cellText = self.formatCell(rawVal)
+                if len(cellText) > widths[j] { widths[j] = len(cellText) }
+                rowCells.push(cellText)
+            }
+            matrix.push(rowCells)
+        }
+
+        let sepParts = ["+"]
+        let headParts = ["|"]
+        for j in range(len(cols)) {
+            sepParts.push(self.repeatChar("-", widths[j] + 2) + "+")
+            headParts.push(" " + self.padCell(cols[j], widths[j], false) + " |")
+        }
+        let border = sepParts.join("")
+        let lines = [border, headParts.join(""), border]
+
+        for rowCells in matrix {
+            let lineParts = ["|"]
+            for j in range(len(cols)) {
+                lineParts.push(" " + self.padCell(rowCells[j], widths[j], numericCols[j]) + " |")
+            }
+            lines.push(lineParts.join(""))
+        }
+        lines.push(border)
+        return lines.join("\n")
+    }
+
+    # Renders `records` as a GitHub-flavored Markdown table.
+    fn markdown(records, columns) {
+        if records == null or len(records) == 0 { return "" }
+        let cols = self.columnsOf(records, columns)
+        if len(cols) == 0 { return "" }
+
+        let head = []
+        let align = []
+        for c in cols {
+            head.push(DbUtil.text(c).replaceAll("|", "\\|"))
+            align.push("---")
+        }
+        let lines = [
+            "| " + head.join(" | ") + " |",
+            "| " + align.join(" | ") + " |"
+        ]
+        for r in records {
+            let cells = []
+            for c in cols {
+                let v = DbUtil.getPath(r, c)
+                let txt = v == null ? "" : self.formatCell(v).replaceAll("|", "\\|").replaceAll("\n", " ")
+                cells.push(txt)
+            }
+            lines.push("| " + cells.join(" | ") + " |")
+        }
+        return lines.join("\n")
+    }
+
+    # ── CSV export & import ──────────────────────────────────────────────
+
+    fn escapeCsvField(value) {
+        if value == null { return "" }
+        let s = (type(value) == "array" or type(value) == "dict") ? JSON.stringify(value) : DbUtil.text(value)
+        if s.contains(",") or s.contains("\"") or s.contains("\n") or s.contains("\r") {
+            return "\"" + s.replaceAll("\"", "\"\"") + "\""
+        }
+        return s
+    }
+
+    fn csv(records, columns) {
+        if records == null or len(records) == 0 { return "" }
+        let cols = self.columnsOf(records, columns)
+        let lines = []
+        let headerCells = []
+        for c in cols { headerCells.push(self.escapeCsvField(c)) }
+        lines.push(headerCells.join(","))
+
+        for r in records {
+            let rowCells = []
+            for c in cols {
+                rowCells.push(self.escapeCsvField(DbUtil.getPath(r, c)))
+            }
+            lines.push(rowCells.join(","))
+        }
+        return lines.join("\n")
+    }
+
+    # Parses CSV text into an array of row dicts using the first row as column headers.
+    fn parseCsv(csvText, options) {
+        let autoTypes = options == null or options.get("autoTypes", true) == true
+        let s = DbUtil.text(csvText).replaceAll("\r\n", "\n").replaceAll("\r", "\n")
+        let rows = self.parseCsvRows(s)
+        if len(rows) <= 1 { return [] }
+
+        let headers = []
+        for h in rows[0] { headers.push(h.trim()) }
+
+        let out = []
+        for i in range(1, len(rows)) {
+            let row = rows[i]
+            if len(row) == 1 and row[0].trim() == "" { continue }
+            let doc = {}
+            for j in range(len(headers)) {
+                let col = headers[j]
+                if col == "" { continue }
+                let rawVal = j < len(row) ? row[j] : ""
+                doc[col] = autoTypes ? DbUtil.autoValue(rawVal) : rawVal
+            }
+            out.push(doc)
+        }
+        return out
+    }
+
+    fn parseCsvRows(s) {
+        let rows = []
+        let currentRow = []
+        let buf = []
+        let inQuotes = false
+        let i = 0
+        let n = len(s)
+
+        while i < n {
+            let ch = s[i]
+            if inQuotes {
+                if ch == "\"" {
+                    if i + 1 < n and s[i + 1] == "\"" {
+                        buf.push("\"")
+                        i += 2
+                        continue
+                    }
+                    inQuotes = false
+                    i += 1
+                    continue
+                }
+                buf.push(ch)
+                i += 1
+            } else {
+                if ch == "\"" {
+                    inQuotes = true
+                    i += 1
+                } else if ch == "," {
+                    currentRow.push(buf.join(""))
+                    buf = []
+                    i += 1
+                } else if ch == "\n" {
+                    currentRow.push(buf.join(""))
+                    buf = []
+                    rows.push(currentRow)
+                    currentRow = []
+                    i += 1
+                } else {
+                    buf.push(ch)
+                    i += 1
+                }
+            }
+        }
+        if len(buf) > 0 or len(currentRow) > 0 {
+            currentRow.push(buf.join(""))
+            rows.push(currentRow)
+        }
+        return rows
+    }
+
+    # ── JSON Lines (JSONL) ───────────────────────────────────────────────
+
+    fn jsonl(records) {
+        let lines = []
+        if records == null { return "" }
+        for r in records { lines.push(JSON.stringify(r)) }
+        return lines.join("\n")
+    }
+
+    fn parseJsonl(text) {
+        let s = DbUtil.text(text).replaceAll("\r\n", "\n").replaceAll("\r", "\n")
+        let out = []
+        for line in s.split("\n") {
+            let t = line.trim()
+            if t != "" { out.push(JSON.parse(t)) }
+        }
+        return out
+    }
+}
+
+DbFormat = __QDbFormat()
